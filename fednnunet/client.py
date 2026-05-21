@@ -431,6 +431,24 @@ class FlowerClient(fl.client.Client):
 
         return target_state_dict
 
+    def get_num_training_examples(self):
+        dataloader = self.trainer.dataloader_train
+        if hasattr(dataloader, "indices"):
+            return len(dataloader.indices)
+
+        dataset = getattr(dataloader, "_data", None)
+        if dataset is None and hasattr(dataloader, "generator"):
+            dataset = getattr(dataloader.generator, "_data", None)
+
+        if hasattr(dataset, "identifiers"):
+            return len(dataset.identifiers)
+        if hasattr(dataset, "keys"):
+            return len(dataset.keys())
+        if hasattr(dataset, "__len__"):
+            return len(dataset)
+
+        return int(self.trainer.dataset_json["numTraining"])
+
     def get_fingerprint(self):
         if not self.local_fingerprint:
             # self.local_fingerprint = extract_fingerprint_dataset(self.dataset_id, clean=True)
@@ -512,7 +530,7 @@ class FlowerClient(fl.client.Client):
             fr = FitRes(
                 parameters=self.get_parameters({}).parameters,
                 status=Status(code=Code(0), message=""),
-                num_examples=len(self.trainer.dataloader_train.generator._data),
+                num_examples=self.get_num_training_examples(),
                 metrics={"loss": float(tl)},
             )
             return fr
