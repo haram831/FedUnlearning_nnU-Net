@@ -317,6 +317,12 @@ parser.add_argument(
 parser.add_argument(
     "--port", type=int, required=True, help="Port number for the server to listen on"
 )
+parser.add_argument(
+    "--num_rounds",
+    type=int,
+    default=None,
+    help="Number of federated training rounds. Defaults to 1 for planning tasks and 1000 for training.",
+)
 
 args = parser.parse_args()
 num_clients = args.num_clients
@@ -329,6 +335,9 @@ else:
     num_rounds = 1000
     # Skip federated evaluation to speed up training by one less parameters transfer
     fraction_evaluate = 0.0
+
+if args.num_rounds is not None:
+    num_rounds = args.num_rounds
 
 strategy = MyStrategy(
     args.task,

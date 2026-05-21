@@ -40,6 +40,12 @@ parser.add_argument(
 parser.add_argument(
     "--port", type=int, required=True, help="Port number for the server to listen on"
 )
+parser.add_argument(
+    "--num_rounds",
+    type=int,
+    default=None,
+    help="Number of federated training rounds to run on the server.",
+)
 
 args, unknown = parser.parse_known_args()
 
@@ -72,6 +78,9 @@ else:
 
 configuration = args.configuration
 port = args.port
+server_optional_args = ""
+if args.num_rounds is not None:
+    server_optional_args = f" --num_rounds {args.num_rounds}"
 
 multi_gpu = True
 
@@ -86,7 +95,7 @@ for fold in folds:
         if multi_gpu:
             process_prefix = "CUDA_VISIBLE_DEVICES=0"
         server_process = subprocess.Popen(
-            f"{process_prefix} python fednnunet/server.py {task} -n {num_clients} --port {port}",
+            f"{process_prefix} python fednnunet/server.py {task} -n {num_clients} --port {port}{server_optional_args}",
             shell=True,
             stderr=subprocess.PIPE,
             text=True,
