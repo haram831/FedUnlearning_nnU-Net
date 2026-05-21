@@ -5,6 +5,14 @@ import torch
 from fednnunet.client import run_client
 
 
+def set_torch_interop_threads_once(num_threads: int) -> None:
+    try:
+        torch.set_num_interop_threads(num_threads)
+    except RuntimeError as e:
+        if "cannot set number of interop threads" not in str(e):
+            raise
+
+
 def client_entry():
     parser = argparse.ArgumentParser()
 
@@ -273,7 +281,7 @@ def client_entry():
         elif args.device == "cuda":
             # multithreading in torch doesn't help nnU-Net if run on GPU
             torch.set_num_threads(1)
-            torch.set_num_interop_threads(1)
+            set_torch_interop_threads_once(1)
             device = torch.device("cuda")
         else:
             device = torch.device("mps")

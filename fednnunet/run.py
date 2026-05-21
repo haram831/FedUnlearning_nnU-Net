@@ -75,10 +75,8 @@ port = args.port
 
 multi_gpu = True
 
-# mnms dataset
-# node_mapping = {301: 2, 302: 2, 303: 3, 304: 3, 305: 4}
-# fetal dataset
-node_mapping = {1: 0, 2: 1, 3: 1, 5: 0}
+# synthetic test datasets
+node_mapping = {301: 0, 302: 0, 303: 0}
 process_prefix = ""
 
 for fold in folds:
