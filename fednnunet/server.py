@@ -95,6 +95,96 @@ def save_global_fingerprint(server_round: int, parameters: Parameters) -> None:
     save_json(global_fingerprint, os.path.join(history_dir, "global_fingerprint_all.json"))
 
 
+def get_federaser_artifact_dir() -> str:
+    nnunet_preprocessed = os.environ.get("nnUNet_preprocessed")
+    if nnunet_preprocessed is None:
+        nnunet_preprocessed = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "federaser_artifacts"
+        )
+        log(
+            WARNING,
+            "nnUNet_preprocessed is not set. Saving FedEraser artifacts under "
+            f"{nnunet_preprocessed}",
+        )
+    return os.path.join(nnunet_preprocessed, "fednnunet_federaser_artifacts")
+
+
+def save_global_checkpoint(
+    global_round: int,
+    global_state_dict: dict,
+    delta_t: int,
+    total_rounds: int,
+) -> None:
+    checkpoint_dir = os.path.join(
+        get_federaser_artifact_dir(),
+        "global_checkpoints",
+        f"round_{global_round:04d}",
+    )
+    maybe_mkdir_p(checkpoint_dir)
+
+    checkpoint_path = os.path.join(checkpoint_dir, "global_checkpoint.pt")
+    torch.save(global_state_dict, checkpoint_path)
+    save_json(
+        {
+            "global_round": global_round,
+            "delta_t": delta_t,
+            "total_rounds": total_rounds,
+            "checkpoint": checkpoint_path,
+        },
+        os.path.join(checkpoint_dir, "metadata.json"),
+    )
+
+
+def subtract_state_dicts(local_state_dict: dict, global_state_dict: dict) -> dict:
+    update = {}
+    for key, local_value in local_state_dict.items():
+        global_value = global_state_dict.get(key)
+        if (
+            torch.is_tensor(local_value)
+            and torch.is_tensor(global_value)
+            and local_value.shape == global_value.shape
+        ):
+            update[key] = local_value.detach().cpu() - global_value.detach().cpu()
+    return update
+
+
+def save_client_update(
+    global_round: int,
+    client_id: str,
+    local_state_dict: dict,
+    global_state_dict: dict,
+    num_examples: int,
+    delta_t: int,
+    total_rounds: int,
+    calibration_r: float,
+) -> None:
+    client_dir = os.path.join(
+        get_federaser_artifact_dir(),
+        "client_updates",
+        f"round_{global_round:04d}",
+        f"client_{client_id}",
+    )
+    maybe_mkdir_p(client_dir)
+
+    client_parameters_path = os.path.join(client_dir, "client_parameters.pt")
+    client_update_path = os.path.join(client_dir, "client_update.pt")
+    torch.save(local_state_dict, client_parameters_path)
+    torch.save(subtract_state_dicts(local_state_dict, global_state_dict), client_update_path)
+    save_json(
+        {
+            "global_round": global_round,
+            "client_id": client_id,
+            "num_examples": num_examples,
+            "delta_t": delta_t,
+            "total_rounds": total_rounds,
+            "calibration_r": calibration_r,
+            "client_parameters": client_parameters_path,
+            "client_update": client_update_path,
+        },
+        os.path.join(client_dir, "metadata.json"),
+    )
+
+
 def average_dicts(dicts):
     if not dicts:
         return {}
@@ -197,6 +287,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
         target_client: Optional[int] = None,
         delta_t: int = 2,
         r: float = 0.5,
+        total_rounds: int = 1000,
         *,
         fraction_fit: float = 1.0,
         fraction_evaluate: float = 1.0,
@@ -237,6 +328,29 @@ class MyStrategy(fl.server.strategy.FedAvg):
         self.target_client = target_client
         self.delta_t = delta_t
         self.r = r
+        self.total_rounds = total_rounds
+        self.latest_global_state_dict = None
+        self.saved_initial_federaser_checkpoint = False
+
+    def should_save_federaser_artifact(self, global_round: int) -> bool:
+        return (
+            global_round == 0
+            or global_round % self.delta_t == 0
+            or global_round == self.total_rounds
+        )
+
+    def save_initial_federaser_checkpoint(self, global_state_dict: dict) -> None:
+        if self.saved_initial_federaser_checkpoint:
+            return
+        if not self.should_save_federaser_artifact(0):
+            return
+        save_global_checkpoint(
+            0,
+            global_state_dict,
+            delta_t=self.delta_t,
+            total_rounds=self.total_rounds,
+        )
+        self.saved_initial_federaser_checkpoint = True
 
     def find_common_layers(self, state_dicts):
         # Find the common keys in all state_dicts
@@ -292,6 +406,10 @@ class MyStrategy(fl.server.strategy.FedAvg):
         if self.task == "extract_fingerprint" or self.task == "plan_and_preprocess":
             return [(client, fit_ins) for client in clients]
 
+        if self.latest_global_state_dict is None and parameters.tensors:
+            self.latest_global_state_dict = parameters_to_state_dict(parameters)
+            self.save_initial_federaser_checkpoint(self.latest_global_state_dict)
+
         parms = [
             parameters_to_state_dict(
                 client.get_parameters(
@@ -312,6 +430,9 @@ class MyStrategy(fl.server.strategy.FedAvg):
 
         # here we are doing the merging already...
         new_state_dict = self.create_compatible_state_dict(parms, compatible_keys)
+        if self.latest_global_state_dict is None:
+            self.latest_global_state_dict = new_state_dict
+            self.save_initial_federaser_checkpoint(new_state_dict)
 
         # Return client/config pairs
         return [(client, fit_ins) for client in clients]
@@ -345,7 +466,27 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 {},
             )
         # Perform aggregation on successful results
+        if self.should_save_federaser_artifact(rnd) and self.latest_global_state_dict is not None:
+            for client_proxy, fit_res in successful_results:
+                save_client_update(
+                    rnd,
+                    client_proxy.cid,
+                    parameters_to_state_dict(fit_res.parameters),
+                    self.latest_global_state_dict,
+                    fit_res.num_examples,
+                    delta_t=self.delta_t,
+                    total_rounds=self.total_rounds,
+                    calibration_r=self.r,
+                )
         aggregated_weights = self.aggregate_weights(successful_results)
+        self.latest_global_state_dict = parameters_to_state_dict(aggregated_weights)
+        if self.should_save_federaser_artifact(rnd):
+            save_global_checkpoint(
+                rnd,
+                self.latest_global_state_dict,
+                delta_t=self.delta_t,
+                total_rounds=self.total_rounds,
+            )
         # Aggregate custom metrics if aggregation fn was provided
         metrics_aggregated = {}
         if self.fit_metrics_aggregation_fn:
@@ -422,6 +563,8 @@ num_clients = args.num_clients
 
 if args.task == "unlearn" and args.target_client is None:
     raise ValueError("--target_client must be specified for the unlearn task")
+if args.delta_t <= 0:
+    raise ValueError("--delta_t must be a positive integer")
 
 if args.task == "extract_fingerprint" or args.task == "plan_and_preprocess":
     num_rounds = 1
@@ -440,6 +583,7 @@ strategy = MyStrategy(
     target_client=args.target_client,
     delta_t=args.delta_t,
     r=args.r,
+    total_rounds=num_rounds,
     min_available_clients=num_clients,
     min_fit_clients=num_clients,
     min_evaluate_clients=num_clients,

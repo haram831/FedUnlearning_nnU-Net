@@ -96,6 +96,8 @@ def main():
         raise ValueError("--target_client must be specified for the unlearn task")
     if args.target_client is not None and args.target_client not in datasets:
         raise ValueError("--target_client must be one of the provided data_centers")
+    if args.delta_t <= 0:
+        raise ValueError("--delta_t must be a positive integer")
 
     gpu_memory_target = None
     gpu_memory_target_mapping = {}
