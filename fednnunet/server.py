@@ -185,6 +185,32 @@ def save_client_update(
     )
 
 
+def save_aggregation_metadata(
+    global_round: int,
+    results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes]],
+) -> str:
+    metadata_dir = os.path.join(
+        get_federaser_artifact_dir(),
+        "aggregation_metadata",
+        f"round_{global_round:04d}",
+    )
+    maybe_mkdir_p(metadata_dir)
+
+    metadata_path = os.path.join(metadata_dir, "metadata.json")
+    save_json(
+        {
+            "round": global_round,
+            "participating_clients": [client_proxy.cid for client_proxy, _ in results],
+            "num_examples": {
+                client_proxy.cid: fit_res.num_examples
+                for client_proxy, fit_res in results
+            },
+        },
+        metadata_path,
+    )
+    return metadata_path
+
+
 def average_dicts(dicts):
     if not dicts:
         return {}
@@ -466,6 +492,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 {},
             )
         # Perform aggregation on successful results
+        save_aggregation_metadata(rnd, successful_results)
         if self.should_save_federaser_artifact(rnd) and self.latest_global_state_dict is not None:
             for client_proxy, fit_res in successful_results:
                 save_client_update(
