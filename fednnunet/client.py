@@ -126,6 +126,44 @@ def add_unlearning_arguments(parser_unlearn: argparse.ArgumentParser) -> None:
     )
 
 
+def add_fingerprint_arguments(parser_fingerprint: argparse.ArgumentParser) -> None:
+    parser_fingerprint.add_argument(
+        "-d",
+        nargs="+",
+        type=int,
+        required=True,
+        help="[REQUIRED] List of dataset IDs. Can be just one dataset.",
+    )
+    parser_fingerprint.add_argument(
+        "-fpe",
+        type=str,
+        required=False,
+        default="DatasetFingerprintExtractor",
+        help="[OPTIONAL] Name of the Dataset Fingerprint Extractor class that should be used. Default is "
+        "'DatasetFingerprintExtractor'.",
+    )
+    parser_fingerprint.add_argument(
+        "-npfp",
+        type=int,
+        default=8,
+        required=False,
+        help="[OPTIONAL] Number of processes used for fingerprint extraction. Default: 8",
+    )
+    parser_fingerprint.add_argument(
+        "--verify_dataset_integrity",
+        required=False,
+        default=False,
+        action="store_true",
+        help="[RECOMMENDED] set this flag to check the dataset integrity.",
+    )
+    parser_fingerprint.add_argument(
+        "--verbose",
+        required=False,
+        action="store_true",
+        help="Set this to print a lot of stuff. Useful for debugging.",
+    )
+
+
 def build_client_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
@@ -150,42 +188,17 @@ def build_client_parser() -> argparse.ArgumentParser:
     add_training_arguments(parser_unlearn)
     add_unlearning_arguments(parser_unlearn)
 
+    parser_extract_fingerprint = subparsers.add_parser(
+        "extract_fingerprint", help="Run federated dataset fingerprint extraction"
+    )
+    add_fingerprint_arguments(parser_extract_fingerprint)
+
     # Arguments for nnUNetv2_plan_and_preprocess command
     parser_plan_and_preprocess = subparsers.add_parser(
         "plan_and_preprocess", help="Run nnUNetv2 planning and preprocessing"
     )
 
-    parser_plan_and_preprocess.add_argument(
-        "-d",
-        nargs="+",
-        type=int,
-        required=True,
-        help="[REQUIRED] List of dataset IDs. Example: 2 4 5. This will run fingerprint extraction, experiment "
-        "planning and preprocessing for these datasets. Can of course also be just one dataset",
-    )
-    parser_plan_and_preprocess.add_argument(
-        "-fpe",
-        type=str,
-        required=False,
-        default="DatasetFingerprintExtractor",
-        help="[OPTIONAL] Name of the Dataset Fingerprint Extractor class that should be used. Default is "
-        "'DatasetFingerprintExtractor'.",
-    )
-    parser_plan_and_preprocess.add_argument(
-        "-npfp",
-        type=int,
-        default=8,
-        required=False,
-        help="[OPTIONAL] Number of processes used for fingerprint extraction. Default: 8",
-    )
-    parser_plan_and_preprocess.add_argument(
-        "--verify_dataset_integrity",
-        required=False,
-        default=False,
-        action="store_true",
-        help="[RECOMMENDED] set this flag to check the dataset integrity. This is useful and should be done once for "
-        "each dataset!",
-    )
+    add_fingerprint_arguments(parser_plan_and_preprocess)
     parser_plan_and_preprocess.add_argument(
         "--no_pp",
         default=False,
@@ -284,14 +297,6 @@ def build_client_parser() -> argparse.ArgumentParser:
         "DECREASE -np IF YOUR RAM FILLS UP TOO MUCH!. Default: 8 processes for 2d, 4 "
         "for 3d_fullres, 8 for 3d_lowres and 4 for everything else",
     )
-    parser_plan_and_preprocess.add_argument(
-        "--verbose",
-        required=False,
-        action="store_true",
-        help="Set this to print a lot of stuff. Useful for debugging. Will disable progress bar! "
-        "Recommended for cluster environments",
-    )
-
     return parser
 
 

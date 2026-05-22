@@ -191,6 +191,9 @@ class FlowerClient(fl.client.Client):
                 self.local_fingerprint,
                 join(self.preprocessed_output_folder, "dataset_fingerprint_local.json"),
             )
+            logging.info(
+                f"Local dataset fingerprint saved to {join(self.preprocessed_output_folder, 'dataset_fingerprint_local.json')}"
+            )
             self.fingerprint = self.local_fingerprint
 
         return self.fingerprint
@@ -231,7 +234,10 @@ class FlowerClient(fl.client.Client):
                 parameters=self.get_parameters({}).parameters,
                 status=Status(code=Code(0), message="Fingerprint extracted"),
                 num_examples=0,
-                metrics={},
+                metrics={
+                    "dataset_id": self.dataset_id,
+                    "dataset_name": self.dataset_name,
+                },
             )
         else:
             # adding try catch errors

@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import flwr as fl
 import torch
+from batchgenerators.utilities.file_and_folder_operations import maybe_mkdir_p, save_json
 from flwr.common import FitIns, MetricsAggregationFn, NDArrays, Parameters, Scalar
 from flwr.common.logger import log
 from flwr.server.client_manager import ClientManager
@@ -33,6 +34,65 @@ def parameters_to_state_dict(parameters: Parameters) -> dict:
     """Converts Flower Parameters back to a PyTorch state_dict."""
     bytes_data = parameters.tensors[0]
     return bytes_to_state_dict(bytes_data)
+
+
+def get_fingerprint_history_dir() -> str:
+    nnunet_preprocessed = os.environ.get("nnUNet_preprocessed")
+    if nnunet_preprocessed is None:
+        nnunet_preprocessed = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "fingerprint_history"
+        )
+        log(
+            WARNING,
+            "nnUNet_preprocessed is not set. Saving fingerprint history under "
+            f"{nnunet_preprocessed}",
+        )
+    return os.path.join(nnunet_preprocessed, "fednnunet_fingerprint_history")
+
+
+def save_client_fingerprint_history(
+    server_round: int,
+    client_id: str,
+    fit_res: fl.common.FitRes,
+) -> None:
+    dataset_id = fit_res.metrics.get("dataset_id", client_id)
+    dataset_name = fit_res.metrics.get("dataset_name", f"client_{client_id}")
+    client_dir = os.path.join(
+        get_fingerprint_history_dir(),
+        f"round_{server_round:04d}",
+        f"client_{dataset_id}",
+    )
+    maybe_mkdir_p(client_dir)
+
+    fingerprint_bytes = fit_res.parameters.tensors[0]
+    bytes_path = os.path.join(client_dir, "dataset_fingerprint_local.bin")
+    with open(bytes_path, "wb") as f:
+        f.write(fingerprint_bytes)
+
+    fingerprint_dict = bytes_to_state_dict(fingerprint_bytes)
+    dict_path = os.path.join(client_dir, "dataset_fingerprint_local.json")
+    save_json(fingerprint_dict, dict_path)
+    save_json(
+        {
+            "server_round": server_round,
+            "client_id": client_id,
+            "dataset_id": dataset_id,
+            "dataset_name": dataset_name,
+            "fingerprint_bytes": bytes_path,
+            "fingerprint_dict": dict_path,
+        },
+        os.path.join(client_dir, "metadata.json"),
+    )
+
+
+def save_global_fingerprint(server_round: int, parameters: Parameters) -> None:
+    history_dir = get_fingerprint_history_dir()
+    round_dir = os.path.join(history_dir, f"round_{server_round:04d}")
+    maybe_mkdir_p(round_dir)
+
+    global_fingerprint = parameters_to_state_dict(parameters)
+    save_json(global_fingerprint, os.path.join(round_dir, "global_fingerprint_all.json"))
+    save_json(global_fingerprint, os.path.join(history_dir, "global_fingerprint_all.json"))
 
 
 def average_dicts(dicts):
@@ -274,10 +334,14 @@ class MyStrategy(fl.server.strategy.FedAvg):
             return None  # or some default values
 
         if self.task == "extract_fingerprint" or self.task == "plan_and_preprocess":
+            for client_proxy, fit_res in successful_results:
+                save_client_fingerprint_history(rnd, client_proxy.cid, fit_res)
+            aggregated_fingerprint = aggregate_fingerprints(
+                [res[1].parameters for res in successful_results]
+            )
+            save_global_fingerprint(rnd, aggregated_fingerprint)
             return (
-                aggregate_fingerprints(
-                    [res[1].parameters for res in successful_results]
-                ),
+                aggregated_fingerprint,
                 {},
             )
         # Perform aggregation on successful results
