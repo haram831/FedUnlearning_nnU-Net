@@ -80,8 +80,11 @@ class FlowerClient(fl.client.Client):
         self.preprocess_dataset = False
 
         self.train = False
-        if self.task == "train":
+        if self.task in ("train", "unlearn"):
             self.train = True
+            self.is_target_client = getattr(args, "is_target_client", False)
+            self.delta_t = getattr(args, "delta_t", None)
+            self.r = getattr(args, "r", None)
             # this calls run_training but is not running any training, I did not change the name of the method for compatibility with regular nnUnet.
             self.trainer = run_training(
                 args.dataset_name_or_id,
@@ -249,7 +252,12 @@ class FlowerClient(fl.client.Client):
                 parameters=self.get_parameters({}).parameters,
                 status=Status(code=Code(0), message=""),
                 num_examples=self.get_num_training_examples(),
-                metrics={"loss": float(tl)},
+                metrics={
+                    "loss": float(tl),
+                    "is_target_client": self.is_target_client,
+                    "delta_t": self.delta_t,
+                    "r": self.r,
+                },
             )
             return fr
 
@@ -324,6 +332,6 @@ def run_client(args, device):
     )
 
     # Clean up after federated training and perform local validation
-    if args.task == "train":
+    if args.task in ("train", "unlearn"):
         client.trainer.on_train_end()
         client.trainer.perform_actual_validation()

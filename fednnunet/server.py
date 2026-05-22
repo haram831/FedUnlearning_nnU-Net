@@ -134,6 +134,9 @@ class MyStrategy(fl.server.strategy.FedAvg):
     def __init__(
         self,
         task: str,
+        target_client: Optional[int] = None,
+        delta_t: int = 2,
+        r: float = 0.5,
         *,
         fraction_fit: float = 1.0,
         fraction_evaluate: float = 1.0,
@@ -171,6 +174,9 @@ class MyStrategy(fl.server.strategy.FedAvg):
         )
 
         self.task = task
+        self.target_client = target_client
+        self.delta_t = delta_t
+        self.r = r
 
     def find_common_layers(self, state_dicts):
         # Find the common keys in all state_dicts
@@ -207,9 +213,13 @@ class MyStrategy(fl.server.strategy.FedAvg):
     ) -> List[Tuple[ClientProxy, FitIns]]:
         """Configure the next round of training."""
         config = {}
+        if self.task == "unlearn" and self.target_client is not None:
+            config["target_client"] = self.target_client
+            config["delta_t"] = self.delta_t
+            config["r"] = self.r
         if self.on_fit_config_fn is not None:
             # Custom fit config function provided
-            config = self.on_fit_config_fn(server_round)
+            config.update(self.on_fit_config_fn(server_round))
         fit_ins = FitIns(parameters, config)
 
         # Sample clients
@@ -305,7 +315,8 @@ parser = argparse.ArgumentParser(description="Start Flower server")
 parser.add_argument(
     "task",
     type=str,
-    help="Determines the task to be performed. Options are: extract_fingerprint, plan_and_preprocess or train",
+    choices=("extract_fingerprint", "plan_and_preprocess", "train", "unlearn"),
+    help="Determines the task to be performed.",
 )
 parser.add_argument(
     "-n",
@@ -323,9 +334,30 @@ parser.add_argument(
     default=None,
     help="Number of federated training rounds. Defaults to 1 for planning tasks and 1000 for training.",
 )
+parser.add_argument(
+    "--target_client",
+    type=int,
+    default=None,
+    help="Dataset id of the client to unlearn. Required for the unlearn task.",
+)
+parser.add_argument(
+    "--delta_t",
+    type=int,
+    default=2,
+    help="FedEraser unlearning interval. Used by the unlearn task. Default: 2.",
+)
+parser.add_argument(
+    "--r",
+    type=float,
+    default=0.5,
+    help="FedEraser calibration ratio. Used by the unlearn task. Default: 0.5.",
+)
 
 args = parser.parse_args()
 num_clients = args.num_clients
+
+if args.task == "unlearn" and args.target_client is None:
+    raise ValueError("--target_client must be specified for the unlearn task")
 
 if args.task == "extract_fingerprint" or args.task == "plan_and_preprocess":
     num_rounds = 1
@@ -341,6 +373,9 @@ if args.num_rounds is not None:
 
 strategy = MyStrategy(
     args.task,
+    target_client=args.target_client,
+    delta_t=args.delta_t,
+    r=args.r,
     min_available_clients=num_clients,
     min_fit_clients=num_clients,
     min_evaluate_clients=num_clients,

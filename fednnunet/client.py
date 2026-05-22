@@ -9,22 +9,7 @@ def set_torch_interop_threads_once(torch_module, num_threads: int) -> None:
             raise
 
 
-def client_entry():
-    parser = argparse.ArgumentParser()
-
-    # Additional arguments for the federated setup
-    # parser.add_argument('task', type=str, help='Determines the task to be performed. Options are: extract_fingerprint, plan_and_preprocess or train')
-    parser.add_argument(
-        "--port", type=int, required=True, help="Port number of the server to listen on"
-    )
-
-    subparsers = parser.add_subparsers(
-        help="Select the nnUNetv2 command to be executed", dest="task", required=True
-    )
-
-    # Arguments for nnUNetv2_train command
-    parser_train = subparsers.add_parser("train", help="Run nnUNetv2 training")
-
+def add_training_arguments(parser_train: argparse.ArgumentParser) -> None:
     parser_train.add_argument(
         "dataset_name_or_id", type=str, help="Dataset name or ID to train with"
     )
@@ -118,6 +103,52 @@ def client_entry():
         "(GPU), 'cpu' (CPU) and 'mps' (Apple M1/M2). Do NOT use this to set which GPU ID! "
         "Use CUDA_VISIBLE_DEVICES=X nnUNetv2_train [...] instead!",
     )
+    parser_train.add_argument(
+        "--is_target_client",
+        action="store_true",
+        required=False,
+        help="[OPTIONAL] Mark this client as the target client for federated unlearning.",
+    )
+
+
+def add_unlearning_arguments(parser_unlearn: argparse.ArgumentParser) -> None:
+    parser_unlearn.add_argument(
+        "--delta_t",
+        type=int,
+        default=2,
+        help="[OPTIONAL] FedEraser unlearning interval. Default: 2.",
+    )
+    parser_unlearn.add_argument(
+        "--r",
+        type=float,
+        default=0.5,
+        help="[OPTIONAL] FedEraser calibration ratio. Default: 0.5.",
+    )
+
+
+def build_client_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+
+    # Additional arguments for the federated setup
+    # parser.add_argument('task', type=str, help='Determines the task to be performed. Options are: extract_fingerprint, plan_and_preprocess or train')
+    parser.add_argument(
+        "--port", type=int, required=True, help="Port number of the server to listen on"
+    )
+
+    subparsers = parser.add_subparsers(
+        help="Select the nnUNetv2 command to be executed", dest="task", required=True
+    )
+
+    # Arguments for nnUNetv2_train command
+    parser_train = subparsers.add_parser("train", help="Run nnUNetv2 training")
+    add_training_arguments(parser_train)
+
+    parser_unlearn = subparsers.add_parser(
+        "unlearn",
+        help="Run federated unlearning for a target client",
+    )
+    add_training_arguments(parser_unlearn)
+    add_unlearning_arguments(parser_unlearn)
 
     # Arguments for nnUNetv2_plan_and_preprocess command
     parser_plan_and_preprocess = subparsers.add_parser(
@@ -261,6 +292,11 @@ def client_entry():
         "Recommended for cluster environments",
     )
 
+    return parser
+
+
+def client_entry():
+    parser = build_client_parser()
     args = parser.parse_args()
 
     import torch
