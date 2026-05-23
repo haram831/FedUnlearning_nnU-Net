@@ -237,10 +237,12 @@ def main():
 
             client_commands = {}
             for client_dataset in datasets:
+                client_id = str(client_dataset)
                 if multi_gpu:
                     gpu = node_mapping[client_dataset]
                     process_prefix = f"CUDA_VISIBLE_DEVICES={gpu}"
 
+                client_global_args = f"--port {port} --client_id {client_id}"
                 optional_args = ""
                 # pass the undefined arguments to the client
                 if unknown:
@@ -255,11 +257,11 @@ def main():
                     optional_args += f"--delta_t {args.delta_t} --r {args.r} "
 
                 if task == "plan_and_preprocess":
-                    command = f"{process_prefix} python fednnunet/client.py --port {port} {task} -d {client_dataset} {optional_args}"
+                    command = f"{process_prefix} python fednnunet/client.py {client_global_args} {task} -d {client_dataset} {optional_args}"
                 elif task in ("train", "unlearn"):
-                    command = f"{process_prefix} python fednnunet/client.py --port {port} {task} {client_dataset} {configuration} {fold} {optional_args}"
+                    command = f"{process_prefix} python fednnunet/client.py {client_global_args} {task} {client_dataset} {configuration} {fold} {optional_args}"
                 else:
-                    command = f"{process_prefix} python fednnunet/client.py --port {port} {task} -d {client_dataset} {optional_args}"
+                    command = f"{process_prefix} python fednnunet/client.py {client_global_args} {task} -d {client_dataset} {optional_args}"
                 client_commands[str(client_dataset)] = command
 
             snapshot_path = save_experiment_config_snapshot(

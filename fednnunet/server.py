@@ -36,6 +36,13 @@ def parameters_to_state_dict(parameters: Parameters) -> dict:
     return bytes_to_state_dict(bytes_data)
 
 
+def get_logical_client_id(
+    client_proxy: fl.server.client_proxy.ClientProxy,
+    fit_res: fl.common.FitRes,
+) -> str:
+    return str(fit_res.metrics.get("client_id", client_proxy.cid))
+
+
 def get_fingerprint_history_dir() -> str:
     nnunet_preprocessed = os.environ.get("nnUNet_preprocessed")
     if nnunet_preprocessed is None:
@@ -60,7 +67,7 @@ def save_client_fingerprint_history(
     client_dir = os.path.join(
         get_fingerprint_history_dir(),
         f"round_{server_round:04d}",
-        f"client_{dataset_id}",
+        f"client_{client_id}",
     )
     maybe_mkdir_p(client_dir)
 
@@ -197,17 +204,33 @@ def save_aggregation_metadata(
     maybe_mkdir_p(metadata_dir)
 
     metadata_path = os.path.join(metadata_dir, "metadata.json")
-    save_json(
-        {
-            "round": global_round,
-            "participating_clients": [client_proxy.cid for client_proxy, _ in results],
-            "num_examples": {
-                client_proxy.cid: fit_res.num_examples
-                for client_proxy, fit_res in results
-            },
+    aggregation_metadata_path = os.path.join(metadata_dir, "aggregation_metadata.json")
+    cid_to_client_id = {
+        client_proxy.cid: get_logical_client_id(client_proxy, fit_res)
+        for client_proxy, fit_res in results
+    }
+    metadata = {
+        "round": global_round,
+        "client_proxy_cid_to_client_id": cid_to_client_id,
+        "participating_clients": [
+            cid_to_client_id[client_proxy.cid] for client_proxy, _ in results
+        ],
+        "num_examples": {
+            cid_to_client_id[client_proxy.cid]: fit_res.num_examples
+            for client_proxy, fit_res in results
         },
-        metadata_path,
-    )
+        "client_metadata": {
+            cid_to_client_id[client_proxy.cid]: {
+                "flower_cid": client_proxy.cid,
+                "client_id": cid_to_client_id[client_proxy.cid],
+                "dataset_id": fit_res.metrics.get("dataset_id"),
+                "dataset_name": fit_res.metrics.get("dataset_name"),
+            }
+            for client_proxy, fit_res in results
+        },
+    }
+    save_json(metadata, metadata_path)
+    save_json(metadata, aggregation_metadata_path)
     return metadata_path
 
 
@@ -482,7 +505,11 @@ class MyStrategy(fl.server.strategy.FedAvg):
 
         if self.task == "extract_fingerprint" or self.task == "plan_and_preprocess":
             for client_proxy, fit_res in successful_results:
-                save_client_fingerprint_history(rnd, client_proxy.cid, fit_res)
+                save_client_fingerprint_history(
+                    rnd,
+                    get_logical_client_id(client_proxy, fit_res),
+                    fit_res,
+                )
             aggregated_fingerprint = aggregate_fingerprints(
                 [res[1].parameters for res in successful_results]
             )
@@ -497,7 +524,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
             for client_proxy, fit_res in successful_results:
                 save_client_update(
                     rnd,
-                    client_proxy.cid,
+                    get_logical_client_id(client_proxy, fit_res),
                     parameters_to_state_dict(fit_res.parameters),
                     self.latest_global_state_dict,
                     fit_res.num_examples,

@@ -172,6 +172,12 @@ def build_client_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--port", type=int, required=True, help="Port number of the server to listen on"
     )
+    parser.add_argument(
+        "--client_id",
+        type=str,
+        default=None,
+        help="[OPTIONAL] Logical federated/unlearning client identifier. Defaults to str(dataset_id).",
+    )
 
     subparsers = parser.add_subparsers(
         help="Select the nnUNetv2 command to be executed", dest="task", required=True

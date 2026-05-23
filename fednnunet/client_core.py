@@ -74,6 +74,7 @@ class FlowerClient(fl.client.Client):
         self.args = args
         self.dataset_name = maybe_convert_to_dataset_name(args.dataset_name_or_id)
         self.dataset_id = convert_dataset_name_to_id(self.dataset_name)
+        self.client_id = getattr(args, "client_id", None) or str(self.dataset_id)
         self.num_samples = None
         self.extract_fingerprint = False
         self.plan_experiment = False
@@ -235,6 +236,7 @@ class FlowerClient(fl.client.Client):
                 status=Status(code=Code(0), message="Fingerprint extracted"),
                 num_examples=0,
                 metrics={
+                    "client_id": self.client_id,
                     "dataset_id": self.dataset_id,
                     "dataset_name": self.dataset_name,
                 },
@@ -259,6 +261,9 @@ class FlowerClient(fl.client.Client):
                 status=Status(code=Code(0), message=""),
                 num_examples=self.get_num_training_examples(),
                 metrics={
+                    "client_id": self.client_id,
+                    "dataset_id": self.dataset_id,
+                    "dataset_name": self.dataset_name,
                     "loss": float(tl),
                     "is_target_client": self.is_target_client,
                     "delta_t": self.delta_t,
@@ -303,7 +308,11 @@ class FlowerClient(fl.client.Client):
                 status=Status(code=Code(0), message="Federated fingerprint saved"),
                 loss=0.0,
                 num_examples=1,
-                metrics={},
+                metrics={
+                    "client_id": self.client_id,
+                    "dataset_id": self.dataset_id,
+                    "dataset_name": self.dataset_name,
+                },
             )
 
         vl = np.round(
@@ -320,7 +329,12 @@ class FlowerClient(fl.client.Client):
             status=Status(code=Code(0), message="yacasi"),
             loss=float(vl),
             num_examples=len(self.trainer.dataloader_val.generator._data),
-            metrics={"fg_dice": float(np.nanmean(dc))},
+            metrics={
+                "client_id": self.client_id,
+                "dataset_id": self.dataset_id,
+                "dataset_name": self.dataset_name,
+                "fg_dice": float(np.nanmean(dc)),
+            },
         )
 
         return er
