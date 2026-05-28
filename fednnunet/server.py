@@ -1,7 +1,7 @@
 import os
 from io import BytesIO
 from logging import INFO, WARNING
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import flwr as fl
 import torch
@@ -262,14 +262,12 @@ def weighted_mean(values, weights):
     return sum(value * weight for value, weight in zip(values, weights)) / sum(weights)
 
 
-def max(values, weights):
-    values = torch.tensor(values)
-    return torch.max(values).item()
+def aggregate_max(values, weights):
+    return torch.tensor(values).max().item()
 
 
-def min(values, weights):
-    values = torch.tensor(values)
-    return torch.min(values).item()
+def aggregate_min(values, weights):
+    return torch.tensor(values).min().item()
 
 
 def concatenate(values, weights):
@@ -277,52 +275,155 @@ def concatenate(values, weights):
     return [item for sublist in values for item in sublist]
 
 
-def aggregate_fingerprints(parameters: List[Parameters]) -> Parameters:
-    # Extract the state_dicts from the parameters
-    state_dicts = [parameters_to_state_dict(p) for p in parameters]
+def pooled_std(means: List[float], variances: List[float], counts: List[int]) -> float:
+    total_count = sum(counts)
+    if total_count == 0:
+        return float("nan")
 
-    # Define aggregation functions for each key in the fingerprint
-    aggregation_dict = {
-        "max": max,
-        "min": min,
-        "mean": weighted_mean,
-        "median": weighted_mean,
-        "std": weighted_mean,
-        "percentile_00_5": weighted_mean,
-        "percentile_99_5": weighted_mean,
-        "median_relative_size_after_cropping": weighted_mean,
-        "shapes_after_crop": concatenate,
-        "spacings": concatenate,
+    global_mean = weighted_mean(means, counts)
+    pooled_variance = sum(
+        count * (variance + (mean - global_mean) ** 2)
+        for mean, variance, count in zip(means, variances, counts)
+    ) / total_count
+    return pooled_variance ** 0.5
+
+
+def aggregate_histograms(histograms: List[Dict[str, Any]]) -> Dict[str, List[float]]:
+    if not histograms:
+        return {"bin_edges": [], "counts": []}
+
+    bin_edges = list(histograms[0]["bin_edges"])
+    counts = [0.0] * len(histograms[0]["counts"])
+    for histogram in histograms:
+        if list(histogram["bin_edges"]) != bin_edges:
+            raise ValueError("Cannot aggregate histograms with different bin edges")
+        if len(histogram["counts"]) != len(counts):
+            raise ValueError("Cannot aggregate histograms with different bin counts")
+        counts = [
+            total_count + float(client_count)
+            for total_count, client_count in zip(counts, histogram["counts"])
+        ]
+
+    return {"bin_edges": bin_edges, "counts": counts}
+
+
+def quantile_from_histogram(histogram: Dict[str, Any], quantile: float) -> float:
+    if not 0 <= quantile <= 1:
+        raise ValueError(f"quantile must be in [0, 1], got {quantile}")
+
+    bin_edges = list(histogram["bin_edges"])
+    counts = [float(i) for i in histogram["counts"]]
+    total_count = sum(counts)
+    if total_count == 0:
+        return float("nan")
+
+    target = quantile * total_count
+    cumulative_count = 0.0
+    for idx, count in enumerate(counts):
+        next_cumulative_count = cumulative_count + count
+        if target <= next_cumulative_count or idx == len(counts) - 1:
+            if count == 0:
+                return float(bin_edges[idx])
+            fraction = (target - cumulative_count) / count
+            left_edge = float(bin_edges[idx])
+            right_edge = float(bin_edges[idx + 1])
+            return left_edge + fraction * (right_edge - left_edge)
+        cumulative_count = next_cumulative_count
+
+    return float(bin_edges[-1])
+
+
+def aggregate_intensity_channel_stats(
+    channel_stats: List[Dict[str, Any]], weights: List[int]
+) -> Dict[str, Any]:
+    counts = [
+        int(stats.get("count", weight))
+        for stats, weight in zip(channel_stats, weights)
+    ]
+    result = {
+        "mean": weighted_mean([stats["mean"] for stats in channel_stats], counts),
+        "min": aggregate_min([stats["min"] for stats in channel_stats], counts),
+        "max": aggregate_max([stats["max"] for stats in channel_stats], counts),
     }
 
-    # Infer number of samples on each client by dict 'shapes_after_crop' length
+    if all("variance" in stats for stats in channel_stats):
+        variances = [stats["variance"] for stats in channel_stats]
+        result["std"] = pooled_std(
+            [stats["mean"] for stats in channel_stats],
+            variances,
+            counts,
+        )
+        result["variance"] = result["std"] ** 2
+        result["count"] = sum(counts)
+    else:
+        result["std"] = weighted_mean([stats["std"] for stats in channel_stats], counts)
+
+    if all("histogram" in stats for stats in channel_stats):
+        histogram = aggregate_histograms([stats["histogram"] for stats in channel_stats])
+        result["histogram"] = histogram
+        result["percentile_00_5"] = quantile_from_histogram(histogram, 0.005)
+        result["median"] = quantile_from_histogram(histogram, 0.5)
+        result["percentile_99_5"] = quantile_from_histogram(histogram, 0.995)
+    else:
+        result["percentile_00_5"] = weighted_mean(
+            [stats["percentile_00_5"] for stats in channel_stats], counts
+        )
+        result["median"] = weighted_mean(
+            [stats["median"] for stats in channel_stats], counts
+        )
+        result["percentile_99_5"] = weighted_mean(
+            [stats["percentile_99_5"] for stats in channel_stats], counts
+        )
+
+    return result
+
+
+def aggregate_fingerprint_dicts(state_dicts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not state_dicts:
+        raise ValueError("Cannot aggregate an empty fingerprint list")
+
     num_samples = [len(sd["shapes_after_crop"]) for sd in state_dicts]
     print(f"Num samples per client: {num_samples}")
 
-    new_state_dict = {}
-    for key in state_dicts[0].keys():
-        if isinstance(state_dicts[0][key], dict):
-            new_state_dict[key] = {}
-            for subkey in state_dicts[0][key].keys():
-                if isinstance(state_dicts[0][key][subkey], dict):
-                    new_state_dict[key][subkey] = {}
-                    for subsubkey in state_dicts[0][key][subkey].keys():
-                        new_state_dict[key][subkey][subsubkey] = aggregation_dict[
-                            subsubkey
-                        ](
-                            [sd[key][subkey][subsubkey] for sd in state_dicts],
-                            num_samples,
-                        )
-                else:
-                    new_state_dict[key][subkey] = aggregation_dict[subkey](
-                        [sd[key][subkey] for sd in state_dicts], num_samples
-                    )
-        # elif isinstance(state_dicts[0][key], list):
-        #     pass
-        else:
-            new_state_dict[key] = aggregation_dict[key](
-                [sd[key] for sd in state_dicts], num_samples
+    new_state_dict = {
+        "spacings": concatenate([sd["spacings"] for sd in state_dicts], num_samples),
+        "shapes_after_crop": concatenate(
+            [sd["shapes_after_crop"] for sd in state_dicts], num_samples
+        ),
+        "foreground_intensity_properties_per_channel": {},
+    }
+
+    for channel in state_dicts[0]["foreground_intensity_properties_per_channel"].keys():
+        new_state_dict["foreground_intensity_properties_per_channel"][channel] = (
+            aggregate_intensity_channel_stats(
+                [
+                    sd["foreground_intensity_properties_per_channel"][channel]
+                    for sd in state_dicts
+                ],
+                num_samples,
             )
+        )
+
+    if all("relative_size_after_cropping_histogram" in sd for sd in state_dicts):
+        histogram = aggregate_histograms(
+            [sd["relative_size_after_cropping_histogram"] for sd in state_dicts]
+        )
+        new_state_dict["relative_size_after_cropping_histogram"] = histogram
+        new_state_dict["median_relative_size_after_cropping"] = quantile_from_histogram(
+            histogram, 0.5
+        )
+    else:
+        new_state_dict["median_relative_size_after_cropping"] = weighted_mean(
+            [sd["median_relative_size_after_cropping"] for sd in state_dicts],
+            num_samples,
+        )
+
+    return new_state_dict
+
+
+def aggregate_fingerprints(parameters: List[Parameters]) -> Parameters:
+    state_dicts = [parameters_to_state_dict(p) for p in parameters]
+    new_state_dict = aggregate_fingerprint_dicts(state_dicts)
 
     # Convert the new state_dict back to parameters
     return state_dict_to_parameters(new_state_dict)
