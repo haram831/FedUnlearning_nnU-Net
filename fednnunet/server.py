@@ -1,3 +1,4 @@
+import json
 import os
 from io import BytesIO
 from logging import INFO, WARNING
@@ -6,7 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import flwr as fl
 import torch
 from batchgenerators.utilities.file_and_folder_operations import maybe_mkdir_p, save_json
-from flwr.common import FitIns, MetricsAggregationFn, NDArrays, Parameters, Scalar
+from flwr.common import EvaluateIns, FitIns, MetricsAggregationFn, NDArrays, Parameters, Scalar
 from flwr.common.logger import log
 from flwr.server.client_manager import ClientManager
 from flwr.server.client_proxy import ClientProxy
@@ -57,24 +58,38 @@ def get_fingerprint_history_dir() -> str:
     return os.path.join(nnunet_preprocessed, "fednnunet_fingerprint_history")
 
 
-def get_federated_fingerprint_config() -> Dict[str, Scalar]:
-    bin_edges = os.environ.get("FEDNNUNET_INTENSITY_HISTOGRAM_BIN_EDGES")
-    if bin_edges:
-        return {"intensity_histogram_bin_edges": bin_edges}
-
-    histogram_range = os.environ.get(
-        "FEDNNUNET_INTENSITY_HISTOGRAM_RANGE",
-        "-1000.0,1000.0",
-    )
+def get_intensity_histogram_num_bins() -> int:
     num_bins = int(os.environ.get("FEDNNUNET_INTENSITY_HISTOGRAM_NUM_BINS", "1000"))
-    if len(histogram_range.split(",")) != 2:
-        raise ValueError("Intensity histogram range must contain exactly two values")
     if num_bins <= 0:
         raise ValueError("Intensity histogram num bins must be positive")
+    return num_bins
+
+# For the first round of fingerprint extraction, we only compute basic intensity stats to keep the client computation light.
+def get_federated_fingerprint_stats_config() -> Dict[str, Scalar]:
+    return {
+        "fingerprint_pass": "stats",
+        "build_intensity_histograms": False,
+    }
+
+# For the second round of fingerprint extraction, we compute intensity histograms to get a more detailed view of the intensity distribution, which can inform better preprocessing decisions.
+def get_global_intensity_histogram_config(global_fingerprint: Dict[str, Any]) -> Dict[str, Scalar]:
+    num_bins = get_intensity_histogram_num_bins()
+    channel_edges = {}
+    for channel, stats in global_fingerprint["foreground_intensity_properties_per_channel"].items():
+        minimum = float(stats["min"])
+        maximum = float(stats["max"])
+        if minimum == maximum:
+            minimum -= 0.5
+            maximum += 0.5
+        channel_edges[str(channel)] = [
+            minimum + (maximum - minimum) * idx / num_bins
+            for idx in range(num_bins + 1)
+        ]
 
     return {
-        "intensity_histogram_range": histogram_range,
-        "intensity_histogram_num_bins": num_bins,
+        "fingerprint_pass": "histogram",
+        "build_intensity_histograms": True,
+        "intensity_histogram_bin_edges_by_channel_json": json.dumps(channel_edges),
     }
 
 
@@ -559,7 +574,14 @@ class MyStrategy(fl.server.strategy.FedAvg):
         """Configure the next round of training."""
         config = {}
         if self.task == "extract_fingerprint" or self.task == "plan_and_preprocess":
-            config.update(get_federated_fingerprint_config())
+            if server_round == 1:
+                config.update(get_federated_fingerprint_stats_config())
+            else:
+                config.update(
+                    get_global_intensity_histogram_config(
+                        parameters_to_state_dict(parameters)
+                    )
+                )
         if self.task == "unlearn" and self.target_client is not None:
             config["target_client"] = self.target_client
             config["delta_t"] = self.delta_t
@@ -609,6 +631,27 @@ class MyStrategy(fl.server.strategy.FedAvg):
 
         # Return client/config pairs
         return [(client, fit_ins) for client in clients]
+
+    def configure_evaluate(
+        self, server_round: int, parameters: Parameters, client_manager: ClientManager
+    ) -> List[Tuple[ClientProxy, EvaluateIns]]:
+        evaluate_instructions = super().configure_evaluate(
+            server_round, parameters, client_manager
+        )
+        if self.task != "extract_fingerprint" and self.task != "plan_and_preprocess":
+            return evaluate_instructions
+
+        fingerprint_pass = "histogram" if server_round >= self.total_rounds else "stats"
+        return [
+            (
+                client,
+                EvaluateIns(
+                    evaluate_ins.parameters,
+                    {**evaluate_ins.config, "fingerprint_pass": fingerprint_pass},
+                ),
+            )
+            for client, evaluate_ins in evaluate_instructions
+        ]
 
     def aggregate_fit(
         self,
@@ -715,7 +758,7 @@ def main() -> None:
         "--num_rounds",
         type=int,
         default=None,
-        help="Number of federated training rounds. Defaults to 1 for planning tasks and 1000 for training.",
+        help="Number of federated training rounds. Defaults to 2 for planning tasks and 1000 for training.",
     )
     parser.add_argument(
         "--target_client",
@@ -745,7 +788,7 @@ def main() -> None:
         raise ValueError("--delta_t must be a positive integer")
 
     if args.task == "extract_fingerprint" or args.task == "plan_and_preprocess":
-        num_rounds = 1
+        num_rounds = 2
         fraction_evaluate = 1.0
     else:
         # nnUNet's default training length
@@ -754,6 +797,11 @@ def main() -> None:
         fraction_evaluate = 0.0
 
     if args.num_rounds is not None:
+        if (
+            args.task in ("extract_fingerprint", "plan_and_preprocess")
+            and args.num_rounds < 2
+        ):
+            raise ValueError("Fingerprint extraction requires at least 2 rounds")
         num_rounds = args.num_rounds
 
     strategy = MyStrategy(

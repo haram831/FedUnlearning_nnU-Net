@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import os
 import sys
@@ -68,6 +69,12 @@ def parse_float_list(value: Any) -> List[float]:
     return [float(i) for i in value]
 
 
+def parse_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 class FlowerClient(fl.client.Client):
 
     def __init__(
@@ -135,6 +142,7 @@ class FlowerClient(fl.client.Client):
             self.extract_fingerprint = True
             self.fingerprint = None
             self.local_fingerprint = None
+            self.local_fingerprint_pass = None
 
         self.preprocessed_output_folder = join(nnUNet_preprocessed, self.dataset_name)
 
@@ -188,6 +196,10 @@ class FlowerClient(fl.client.Client):
             extractor_kwargs["intensity_histogram_bin_edges"] = parse_float_list(bin_edges)
             return extractor_kwargs
 
+        bin_edges_by_channel = config.get("intensity_histogram_bin_edges_by_channel_json")
+        if bin_edges_by_channel:
+            extractor_kwargs["intensity_histogram_bin_edges_by_channel"] = json.loads(bin_edges_by_channel)
+
         histogram_range = config.get("intensity_histogram_range")
         if histogram_range:
             extractor_kwargs["intensity_histogram_range"] = parse_float_list(histogram_range)
@@ -195,6 +207,10 @@ class FlowerClient(fl.client.Client):
         num_bins = config.get("intensity_histogram_num_bins")
         if num_bins is not None:
             extractor_kwargs["intensity_histogram_num_bins"] = int(num_bins)
+
+        build_histograms = config.get("build_intensity_histograms")
+        if build_histograms is not None:
+            extractor_kwargs["build_intensity_histograms"] = parse_bool(build_histograms)
 
         return extractor_kwargs
 
@@ -205,7 +221,8 @@ class FlowerClient(fl.client.Client):
         return getattr(ins, "config", {}) or {}
 
     def get_fingerprint(self, config: Optional[Dict[str, Any]] = None):
-        if not self.local_fingerprint:
+        fingerprint_pass = (config or {}).get("fingerprint_pass")
+        if not self.local_fingerprint or self.local_fingerprint_pass != fingerprint_pass:
             # self.local_fingerprint = extract_fingerprint_dataset(self.dataset_id, clean=True)
             fingerprint_extractor_class = recursive_find_python_class(
                 join(nnunetv2.__path__[0], "experiment_planning"),
@@ -221,6 +238,7 @@ class FlowerClient(fl.client.Client):
                 verbose=self.args.verbose,
                 fingerprint_extractor_kwargs=self.get_fingerprint_extractor_kwargs(config),
             )
+            self.local_fingerprint_pass = fingerprint_pass
             self.num_samples = len(self.local_fingerprint["shapes_after_crop"])
             save_json(
                 self.local_fingerprint,
@@ -309,8 +327,21 @@ class FlowerClient(fl.client.Client):
     def evaluate(self, ei):
         # We need to update to the aggregated parameters, otherwise the model will be evaluated on local weights
         self.set_parameters(ei.parameters)
+        config = self.get_config(ei)
 
         if self.extract_fingerprint:
+            if config.get("fingerprint_pass") == "stats":
+                return EvaluateRes(
+                    status=Status(code=Code(0), message="Fingerprint stats pass complete"),
+                    loss=0.0,
+                    num_examples=1,
+                    metrics={
+                        "client_id": self.client_id,
+                        "dataset_id": self.dataset_id,
+                        "dataset_name": self.dataset_name,
+                    },
+                )
+
             save_json(
                 self.fingerprint,
                 join(self.preprocessed_output_folder, "dataset_fingerprint.json"),
