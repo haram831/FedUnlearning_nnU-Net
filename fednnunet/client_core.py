@@ -3,7 +3,7 @@ import logging
 import os
 import sys
 from io import BytesIO
-from typing import List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import flwr as fl
 import numpy as np
@@ -60,6 +60,12 @@ def parameters_to_state_dict(parameters: Parameters) -> dict:
     """Converts Flower Parameters back to a PyTorch state_dict."""
     bytes_data = parameters.tensors[0]
     return bytes_to_state_dict(bytes_data)
+
+
+def parse_float_list(value: Any) -> List[float]:
+    if isinstance(value, str):
+        return [float(i) for i in value.split(",")]
+    return [float(i) for i in value]
 
 
 class FlowerClient(fl.client.Client):
@@ -171,7 +177,34 @@ class FlowerClient(fl.client.Client):
 
         return int(self.trainer.dataset_json["numTraining"])
 
-    def get_fingerprint(self):
+    @staticmethod
+    def get_fingerprint_extractor_kwargs(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if not config:
+            return {}
+
+        extractor_kwargs = {}
+        bin_edges = config.get("intensity_histogram_bin_edges")
+        if bin_edges:
+            extractor_kwargs["intensity_histogram_bin_edges"] = parse_float_list(bin_edges)
+            return extractor_kwargs
+
+        histogram_range = config.get("intensity_histogram_range")
+        if histogram_range:
+            extractor_kwargs["intensity_histogram_range"] = parse_float_list(histogram_range)
+
+        num_bins = config.get("intensity_histogram_num_bins")
+        if num_bins is not None:
+            extractor_kwargs["intensity_histogram_num_bins"] = int(num_bins)
+
+        return extractor_kwargs
+
+    @staticmethod
+    def get_config(ins: Any) -> Dict[str, Any]:
+        if isinstance(ins, dict):
+            return ins
+        return getattr(ins, "config", {}) or {}
+
+    def get_fingerprint(self, config: Optional[Dict[str, Any]] = None):
         if not self.local_fingerprint:
             # self.local_fingerprint = extract_fingerprint_dataset(self.dataset_id, clean=True)
             fingerprint_extractor_class = recursive_find_python_class(
@@ -186,6 +219,7 @@ class FlowerClient(fl.client.Client):
                 check_dataset_integrity=self.args.verify_dataset_integrity,
                 clean=True,
                 verbose=self.args.verbose,
+                fingerprint_extractor_kwargs=self.get_fingerprint_extractor_kwargs(config),
             )
             self.num_samples = len(self.local_fingerprint["shapes_after_crop"])
             save_json(
@@ -201,7 +235,7 @@ class FlowerClient(fl.client.Client):
 
     def get_parameters(self, fi):
         if self.extract_fingerprint:
-            parameters = self.get_fingerprint()
+            parameters = self.get_fingerprint(self.get_config(fi))
             # print(f'Fingerprint with mean: {self.fingerprint["median_relative_size_after_cropping"]}')
         else:
             parameters = self.model.state_dict()
@@ -232,7 +266,7 @@ class FlowerClient(fl.client.Client):
 
         if self.extract_fingerprint:
             return FitRes(
-                parameters=self.get_parameters({}).parameters,
+                parameters=self.get_parameters(fi).parameters,
                 status=Status(code=Code(0), message="Fingerprint extracted"),
                 num_examples=0,
                 metrics={

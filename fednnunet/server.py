@@ -57,6 +57,27 @@ def get_fingerprint_history_dir() -> str:
     return os.path.join(nnunet_preprocessed, "fednnunet_fingerprint_history")
 
 
+def get_federated_fingerprint_config() -> Dict[str, Scalar]:
+    bin_edges = os.environ.get("FEDNNUNET_INTENSITY_HISTOGRAM_BIN_EDGES")
+    if bin_edges:
+        return {"intensity_histogram_bin_edges": bin_edges}
+
+    histogram_range = os.environ.get(
+        "FEDNNUNET_INTENSITY_HISTOGRAM_RANGE",
+        "-1000.0,1000.0",
+    )
+    num_bins = int(os.environ.get("FEDNNUNET_INTENSITY_HISTOGRAM_NUM_BINS", "1000"))
+    if len(histogram_range.split(",")) != 2:
+        raise ValueError("Intensity histogram range must contain exactly two values")
+    if num_bins <= 0:
+        raise ValueError("Intensity histogram num bins must be positive")
+
+    return {
+        "intensity_histogram_range": histogram_range,
+        "intensity_histogram_num_bins": num_bins,
+    }
+
+
 def save_client_fingerprint_history(
     server_round: int,
     client_id: str,
@@ -537,6 +558,8 @@ class MyStrategy(fl.server.strategy.FedAvg):
     ) -> List[Tuple[ClientProxy, FitIns]]:
         """Configure the next round of training."""
         config = {}
+        if self.task == "extract_fingerprint" or self.task == "plan_and_preprocess":
+            config.update(get_federated_fingerprint_config())
         if self.task == "unlearn" and self.target_client is not None:
             config["target_client"] = self.target_client
             config["delta_t"] = self.delta_t
