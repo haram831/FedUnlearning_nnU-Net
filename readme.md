@@ -74,7 +74,7 @@ python fednnunet/server.py command --num_clients number_of_nodes fold --port net
 Start each node
 
 ```bash
-python fednnunet/client.py command dataset_id configuration fold --port network_port
+python fednnunet/client.py --port network_port command dataset_id configuration fold
 ```
 
 #### 💻 Start server and clients automatically (one machine setup)
@@ -188,5 +188,4 @@ This work received funding from the European Union’s Horizon Europe research a
 
 
 <img src="assets/dt4h_logo.png" width="120">  <img src="assets/radioval_logo.jpeg" width="250"> <img src="assets/aimix_logo.png" width="160">    <img src="assets/eucanimage_logo.jpeg" width="160">
-
 
