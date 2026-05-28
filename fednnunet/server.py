@@ -667,89 +667,91 @@ class MyStrategy(fl.server.strategy.FedAvg):
         return state_dict_to_parameters(new_state_dict)
 
 
-# Start Flower server with the custom strategy
+def main() -> None:
+    # Start Flower server with the custom strategy
+    import argparse
 
-import argparse
+    parser = argparse.ArgumentParser(description="Start Flower server")
+    parser.add_argument(
+        "task",
+        type=str,
+        choices=("extract_fingerprint", "plan_and_preprocess", "train", "unlearn"),
+        help="Determines the task to be performed.",
+    )
+    parser.add_argument(
+        "-n",
+        "--num_clients",
+        type=int,
+        default=2,
+        help="Number of clients to wait for before starting the server",
+    )
+    parser.add_argument(
+        "--port", type=int, required=True, help="Port number for the server to listen on"
+    )
+    parser.add_argument(
+        "--num_rounds",
+        type=int,
+        default=None,
+        help="Number of federated training rounds. Defaults to 1 for planning tasks and 1000 for training.",
+    )
+    parser.add_argument(
+        "--target_client",
+        type=int,
+        default=None,
+        help="Dataset id of the client to unlearn. Required for the unlearn task.",
+    )
+    parser.add_argument(
+        "--delta_t",
+        type=int,
+        default=2,
+        help="FedEraser unlearning interval. Used by the unlearn task. Default: 2.",
+    )
+    parser.add_argument(
+        "--r",
+        type=float,
+        default=0.5,
+        help="FedEraser calibration ratio. Used by the unlearn task. Default: 0.5.",
+    )
 
-parser = argparse.ArgumentParser(description="Start Flower server")
-parser.add_argument(
-    "task",
-    type=str,
-    choices=("extract_fingerprint", "plan_and_preprocess", "train", "unlearn"),
-    help="Determines the task to be performed.",
-)
-parser.add_argument(
-    "-n",
-    "--num_clients",
-    type=int,
-    default=2,
-    help="Number of clients to wait for before starting the server",
-)
-parser.add_argument(
-    "--port", type=int, required=True, help="Port number for the server to listen on"
-)
-parser.add_argument(
-    "--num_rounds",
-    type=int,
-    default=None,
-    help="Number of federated training rounds. Defaults to 1 for planning tasks and 1000 for training.",
-)
-parser.add_argument(
-    "--target_client",
-    type=int,
-    default=None,
-    help="Dataset id of the client to unlearn. Required for the unlearn task.",
-)
-parser.add_argument(
-    "--delta_t",
-    type=int,
-    default=2,
-    help="FedEraser unlearning interval. Used by the unlearn task. Default: 2.",
-)
-parser.add_argument(
-    "--r",
-    type=float,
-    default=0.5,
-    help="FedEraser calibration ratio. Used by the unlearn task. Default: 0.5.",
-)
+    args = parser.parse_args()
+    num_clients = args.num_clients
 
-args = parser.parse_args()
-num_clients = args.num_clients
+    if args.task == "unlearn" and args.target_client is None:
+        raise ValueError("--target_client must be specified for the unlearn task")
+    if args.delta_t <= 0:
+        raise ValueError("--delta_t must be a positive integer")
 
-if args.task == "unlearn" and args.target_client is None:
-    raise ValueError("--target_client must be specified for the unlearn task")
-if args.delta_t <= 0:
-    raise ValueError("--delta_t must be a positive integer")
+    if args.task == "extract_fingerprint" or args.task == "plan_and_preprocess":
+        num_rounds = 1
+        fraction_evaluate = 1.0
+    else:
+        # nnUNet's default training length
+        num_rounds = 1000
+        # Skip federated evaluation to speed up training by one less parameters transfer
+        fraction_evaluate = 0.0
 
-if args.task == "extract_fingerprint" or args.task == "plan_and_preprocess":
-    num_rounds = 1
-    fraction_evaluate = 1.0
-else:
-    # nnUNet's default training length
-    num_rounds = 1000
-    # Skip federated evaluation to speed up training by one less parameters transfer
-    fraction_evaluate = 0.0
+    if args.num_rounds is not None:
+        num_rounds = args.num_rounds
 
-if args.num_rounds is not None:
-    num_rounds = args.num_rounds
+    strategy = MyStrategy(
+        args.task,
+        target_client=args.target_client,
+        delta_t=args.delta_t,
+        r=args.r,
+        total_rounds=num_rounds,
+        min_available_clients=num_clients,
+        min_fit_clients=num_clients,
+        min_evaluate_clients=num_clients,
+        fraction_evaluate=fraction_evaluate,
+    )
 
-strategy = MyStrategy(
-    args.task,
-    target_client=args.target_client,
-    delta_t=args.delta_t,
-    r=args.r,
-    total_rounds=num_rounds,
-    min_available_clients=num_clients,
-    min_fit_clients=num_clients,
-    min_evaluate_clients=num_clients,
-    fraction_evaluate=fraction_evaluate,
-)
+    fl.server.start_server(
+        server_address=f"0.0.0.0:{args.port}",
+        strategy=strategy,
+        config=fl.server.ServerConfig(num_rounds=num_rounds),
+        grpc_max_message_length=2147483647,  # Request a maximum message length to support sending weights from larger, more recent ResEnc architectures
+    )
 
 
-# Start Flower server
-fl.server.start_server(
-    server_address=f"0.0.0.0:{args.port}",
-    strategy=strategy,
-    config=fl.server.ServerConfig(num_rounds=num_rounds),
-    grpc_max_message_length=2147483647,  # Request a maximum message length to support sending weights from larger, more recent ResEnc architectures
-)
+if __name__ == "__main__":
+    main()
