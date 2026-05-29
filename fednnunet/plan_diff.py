@@ -4,6 +4,7 @@ import os
 import shutil
 from typing import Any, Dict, Optional, Tuple
 
+import numpy as np
 from batchgenerators.utilities.file_and_folder_operations import (
     join,
     load_json,
@@ -15,6 +16,8 @@ from batchgenerators.utilities.file_and_folder_operations import (
 ARCHITECTURE_FIELDS = (
     ("architecture.network_class_name", ("architecture", "network_class_name")),
     ("architecture.arch_kwargs.n_stages", ("architecture", "arch_kwargs", "n_stages")),
+    ("architecture.arch_kwargs.features_per_stage", ("architecture", "arch_kwargs", "features_per_stage")),
+    ("architecture.arch_kwargs.conv_op", ("architecture", "arch_kwargs", "conv_op")),
     ("architecture.arch_kwargs.strides", ("architecture", "arch_kwargs", "strides")),
     ("architecture.arch_kwargs.kernel_sizes", ("architecture", "arch_kwargs", "kernel_sizes")),
     (
@@ -36,6 +39,19 @@ PREPROCESSING_FIELDS = (
     ("normalization_schemes", ("normalization_schemes",)),
     ("use_mask_for_norm", ("use_mask_for_norm",)),
 )
+
+PLAN_DISTANCE_WEIGHTS = {
+    "spacing": 0.15,
+    "patch_size": 0.15,
+    "batch_size": 0.08,
+    "median_image_size": 0.10,
+    "pooling": 0.17,
+    "conv_kernel": 0.12,
+    "network_depth": 0.10,
+    "normalization": 0.05,
+    "preprocessor": 0.03,
+    "configuration": 0.05,
+}
 
 
 def get_plan_path(dataset_id: int, plans_identifier: str) -> str:
@@ -74,6 +90,144 @@ def _changed_fields(
                 "minus_target": minus_value,
             }
     return changes
+
+
+def _as_float_array(value: Any) -> Optional[np.ndarray]:
+    if value is None:
+        return None
+    try:
+        return np.asarray(value, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalized_l2_value(original: Any, minus: Any, eps: float = 1e-8) -> float:
+    original_array = _as_float_array(original)
+    minus_array = _as_float_array(minus)
+    if original_array is None or minus_array is None:
+        return 0.0 if original == minus else 1.0
+    if original_array.shape != minus_array.shape:
+        return 1.0
+    raw_distance = float(np.linalg.norm(original_array - minus_array))
+    scale = max(float(np.linalg.norm(original_array)), float(np.linalg.norm(minus_array)), eps)
+    return raw_distance / scale
+
+
+def _categorical_distance(original: Any, minus: Any) -> float:
+    return 0.0 if original == minus else 1.0
+
+
+def _network_depth_value(configuration: Dict[str, Any]) -> Any:
+    return [
+        _get_nested(configuration, ("architecture", "arch_kwargs", "n_stages")),
+        _get_nested(configuration, ("architecture", "arch_kwargs", "n_conv_per_stage")),
+        _get_nested(configuration, ("architecture", "arch_kwargs", "n_conv_per_stage_decoder")),
+    ]
+
+
+def _configuration_plan_distances(
+    original_config: Dict[str, Any],
+    minus_config: Dict[str, Any],
+) -> Dict[str, float]:
+    return {
+        "spacing": _normalized_l2_value(original_config.get("spacing"), minus_config.get("spacing")),
+        "patch_size": _normalized_l2_value(original_config.get("patch_size"), minus_config.get("patch_size")),
+        "batch_size": _normalized_l2_value(original_config.get("batch_size"), minus_config.get("batch_size")),
+        "median_image_size": _normalized_l2_value(
+            original_config.get("median_image_size_in_voxels"),
+            minus_config.get("median_image_size_in_voxels"),
+        ),
+        "pooling": _normalized_l2_value(
+            _get_nested(original_config, ("architecture", "arch_kwargs", "strides")),
+            _get_nested(minus_config, ("architecture", "arch_kwargs", "strides")),
+        ),
+        "conv_kernel": _normalized_l2_value(
+            _get_nested(original_config, ("architecture", "arch_kwargs", "kernel_sizes")),
+            _get_nested(minus_config, ("architecture", "arch_kwargs", "kernel_sizes")),
+        ),
+        "network_depth": _normalized_l2_value(
+            _network_depth_value(original_config),
+            _network_depth_value(minus_config),
+        ),
+        "normalization": max(
+            _categorical_distance(
+                original_config.get("normalization_schemes"),
+                minus_config.get("normalization_schemes"),
+            ),
+            _categorical_distance(
+                original_config.get("use_mask_for_norm"),
+                minus_config.get("use_mask_for_norm"),
+            ),
+        ),
+        "preprocessor": _categorical_distance(
+            original_config.get("preprocessor_name"),
+            minus_config.get("preprocessor_name"),
+        ),
+    }
+
+
+def _normalize_plan_distance_weights(weights: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+    merged = dict(PLAN_DISTANCE_WEIGHTS)
+    if weights:
+        merged.update({key: float(value) for key, value in weights.items()})
+    total = sum(max(float(value), 0.0) for value in merged.values())
+    if total <= 0:
+        raise ValueError("At least one plan distance weight must be positive")
+    return {key: max(float(value), 0.0) / total for key, value in merged.items()}
+
+
+def _compute_plan_distance(
+    shared_configurations: Any,
+    added_configurations: Any,
+    removed_configurations: Any,
+    original_configurations: Dict[str, Any],
+    minus_configurations: Dict[str, Any],
+    weights: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    normalized_weights = _normalize_plan_distance_weights(weights)
+    component_values = {component: [] for component in normalized_weights}
+    configuration_details = {}
+    component_values["configuration"].append(
+        1.0 if added_configurations or removed_configurations else 0.0
+    )
+
+    for configuration in shared_configurations:
+        distances = _configuration_plan_distances(
+            original_configurations[configuration],
+            minus_configurations[configuration],
+        )
+        configuration_details[configuration] = distances
+        for component, value in distances.items():
+            component_values[component].append(float(value))
+
+    component_distances = {
+        component: float(np.mean(values)) if values else 0.0
+        for component, values in component_values.items()
+    }
+    contributions = {
+        component: normalized_weights[component] * distance
+        for component, distance in component_distances.items()
+    }
+    top_contributors = [
+        {
+            "component": component,
+            "value": component_distances[component],
+            "weighted_value": contribution,
+        }
+        for component, contribution in sorted(
+            contributions.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+    ]
+    return {
+        "plan_distance": float(sum(contributions.values())),
+        "plan_distance_weights": normalized_weights,
+        "plan_distance_components": component_distances,
+        "plan_distance_contributions": contributions,
+        "plan_top_contributors": top_contributors,
+        "configuration_plan_distance_components": configuration_details,
+    }
 
 
 def _top_level_preprocessing_changes(
@@ -145,6 +299,7 @@ def compute_plan_diff(
     configuration_diffs = {}
     architecture_changed = bool(added_configurations or removed_configurations)
     preprocessing_changed = False
+    preprocessing_changed_any = False
 
     for configuration in shared_configurations:
         original_config = original_configurations[configuration]
@@ -163,6 +318,7 @@ def compute_plan_diff(
             architecture_changed = True
         if preprocessing_changes:
             preprocessing_changed = True
+            preprocessing_changed_any = True
         configuration_diffs[configuration] = {
             "architecture_changes": architecture_changes,
             "preprocessing_changes": preprocessing_changes,
@@ -175,14 +331,24 @@ def compute_plan_diff(
     )
     if top_level_preprocessing_changes:
         preprocessing_changed = True
+        preprocessing_changed_any = True
+    plan_distance = _compute_plan_distance(
+        shared_configurations,
+        added_configurations,
+        removed_configurations,
+        original_configurations,
+        minus_configurations,
+    )
 
-    return {
+    result = {
         "target_client": str(target_client),
         "planning_dataset_id": int(planning_dataset_id),
         "plans_identifier": plans_identifier,
         "minus_plans_identifier": minus_plans_identifier,
         "architecture_changed": bool(architecture_changed),
         "preprocessing_changed": bool(preprocessing_changed and not architecture_changed),
+        "preprocessing_changed_any": bool(preprocessing_changed_any),
+        "preprocessing_only_changed": bool(preprocessing_changed and not architecture_changed),
         "normalization_changed": any(
             "normalization_schemes" in diff["preprocessing_changes"]
             or "use_mask_for_norm" in diff["preprocessing_changes"]
@@ -197,6 +363,8 @@ def compute_plan_diff(
         "configurations": configuration_diffs,
         "top_level_preprocessing_changes": top_level_preprocessing_changes,
     }
+    result.update(plan_distance)
+    return result
 
 
 def save_plan_diff_artifacts(

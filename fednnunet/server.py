@@ -23,6 +23,13 @@ from fednnunet.plan_diff import (
     load_plan,
     save_plan_diff_artifacts,
 )
+from fednnunet.unlearning_policy import (
+    DEFAULT_TAU_FP_LOW,
+    DEFAULT_TAU_PLAN_HIGH,
+    DEFAULT_TAU_PLAN_LOW,
+    decide_unlearning_policy,
+    save_unlearning_policy_artifact,
+)
 
 
 def state_dict_to_bytes(state_dict) -> bytes:
@@ -529,6 +536,9 @@ class MyStrategy(fl.server.strategy.FedAvg):
         plan_diff_planner: str = "ExperimentPlanner",
         plan_diff_preprocessor_name: str = "DefaultPreprocessor",
         plan_diff_gpu_memory_target: Optional[float] = None,
+        tau_fp_low: float = DEFAULT_TAU_FP_LOW,
+        tau_plan_low: float = DEFAULT_TAU_PLAN_LOW,
+        tau_plan_high: float = DEFAULT_TAU_PLAN_HIGH,
         *,
         fraction_fit: float = 1.0,
         fraction_evaluate: float = 1.0,
@@ -575,6 +585,9 @@ class MyStrategy(fl.server.strategy.FedAvg):
         self.plan_diff_planner = plan_diff_planner
         self.plan_diff_preprocessor_name = plan_diff_preprocessor_name
         self.plan_diff_gpu_memory_target = plan_diff_gpu_memory_target
+        self.tau_fp_low = tau_fp_low
+        self.tau_plan_low = tau_plan_low
+        self.tau_plan_high = tau_plan_high
         self.saved_plan_diff_artifact = False
         self.latest_global_state_dict = None
         self.saved_initial_federaser_checkpoint = False
@@ -655,11 +668,22 @@ class MyStrategy(fl.server.strategy.FedAvg):
             plans_identifier=self.plans_identifier,
             minus_plans_identifier=minus_plans_identifier,
         )
+        unlearning_policy = decide_unlearning_policy(
+            fingerprint_precheck_report,
+            plan_diff,
+            tau_fp_low=self.tau_fp_low,
+            tau_plan_low=self.tau_plan_low,
+            tau_plan_high=self.tau_plan_high,
+        )
         paths = save_plan_diff_artifacts(
             artifact_dir,
             original_plan,
             minus_plan,
             plan_diff,
+        )
+        policy_path = save_unlearning_policy_artifact(
+            artifact_dir,
+            unlearning_policy,
         )
         generated_plan_snapshot = copy_generated_minus_plan(
             planning_dataset_id,
@@ -680,6 +704,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 "excluded_clients": [target_client],
                 "artifact_paths": {
                     **paths,
+                    "unlearning_policy": policy_path,
                     "generated_minus_plan_snapshot": generated_plan_snapshot,
                     "fingerprint_precheck": fingerprint_precheck_paths,
                 },
@@ -981,6 +1006,24 @@ def main() -> None:
         default=None,
         help="GPU memory target in GB used to generate P_minus_target.",
     )
+    parser.add_argument(
+        "--tau_fp_low",
+        type=float,
+        default=DEFAULT_TAU_FP_LOW,
+        help="Fingerprint distance low threshold for Level 0 policy decisions.",
+    )
+    parser.add_argument(
+        "--tau_plan_low",
+        type=float,
+        default=DEFAULT_TAU_PLAN_LOW,
+        help="Plan distance low threshold for Level 0 policy decisions.",
+    )
+    parser.add_argument(
+        "--tau_plan_high",
+        type=float,
+        default=DEFAULT_TAU_PLAN_HIGH,
+        help="Plan distance high threshold for Level 2 policy decisions.",
+    )
 
     args = parser.parse_args()
     num_clients = args.num_clients
@@ -1018,6 +1061,9 @@ def main() -> None:
         plan_diff_planner=args.plan_diff_planner,
         plan_diff_preprocessor_name=args.plan_diff_preprocessor_name,
         plan_diff_gpu_memory_target=args.plan_diff_gpu_memory_target,
+        tau_fp_low=args.tau_fp_low,
+        tau_plan_low=args.tau_plan_low,
+        tau_plan_high=args.tau_plan_high,
         min_available_clients=num_clients,
         min_fit_clients=num_clients,
         min_evaluate_clients=num_clients,
