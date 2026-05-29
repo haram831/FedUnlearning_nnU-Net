@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
+from batchgenerators.utilities.file_and_folder_operations import maybe_mkdir_p, save_json
 
 
 DEFAULT_WEIGHTS = {
@@ -47,6 +49,23 @@ def relative_absolute_difference(a: float, b: float, eps: float = 1e-8) -> Dict[
         "raw_distance": raw_distance,
         "normalization_scale": scale,
         "normalized_distance": raw_distance / scale,
+        "notes": [],
+    }
+
+
+def absolute_difference_with_scale(
+    a: float,
+    b: float,
+    scale: float,
+    eps: float = 1e-8,
+) -> Dict[str, Any]:
+    raw_distance = abs(_to_float(a) - _to_float(b))
+    normalization_scale = max(float(scale), eps)
+    return {
+        "metric": "absolute_difference_with_scale",
+        "raw_distance": raw_distance,
+        "normalization_scale": normalization_scale,
+        "normalized_distance": raw_distance / normalization_scale,
         "notes": [],
     }
 
@@ -166,6 +185,22 @@ def _shared_channel_stats(
     return shared, missing
 
 
+def _intensity_range_scale(
+    original_stats: Dict[str, Any],
+    excluded_stats: Dict[str, Any],
+    eps: float = 1e-8,
+) -> float:
+    ranges = []
+    for stats in (original_stats, excluded_stats):
+        if "percentile_99_5" in stats and "percentile_00_5" in stats:
+            ranges.append(
+                abs(float(stats["percentile_99_5"]) - float(stats["percentile_00_5"]))
+            )
+        elif "max" in stats and "min" in stats:
+            ranges.append(abs(float(stats["max"]) - float(stats["min"])))
+    return max(ranges + [eps])
+
+
 def _spacing_or_shape_distance(
     original: Dict[str, Any],
     excluded: Dict[str, Any],
@@ -235,13 +270,15 @@ def _foreground_intensity_distance(original: Dict[str, Any], excluded: Dict[str,
         excluded_stats = excluded_channels[channel]
         stat_distances = {}
         stat_values = []
+        intensity_scale = _intensity_range_scale(original_stats, excluded_stats)
         for stat_key in DEFAULT_INTENSITY_STAT_KEYS:
             if stat_key not in original_stats or stat_key not in excluded_stats:
                 notes.append(f"Channel {channel} missing stat {stat_key}; stat skipped.")
                 continue
-            stat_distance = relative_absolute_difference(
+            stat_distance = absolute_difference_with_scale(
                 original_stats[stat_key],
                 excluded_stats[stat_key],
+                intensity_scale,
             )
             stat_distances[stat_key] = stat_distance
             stat_values.append(_distance_or_zero(stat_distance))
@@ -270,6 +307,7 @@ def _foreground_intensity_distance(original: Dict[str, Any], excluded: Dict[str,
         channel_details[channel] = {
             "normalized_distance": channel_distance,
             "weight": channel_weight,
+            "normalization_scale": intensity_scale,
             "stats": stat_distances,
             "histogram": histogram_distance,
         }
@@ -325,6 +363,43 @@ def _normalize_weights(weights: Optional[Dict[str, float]]) -> Dict[str, float]:
     if total <= 0:
         raise ValueError("At least one fingerprint distance weight must be positive")
     return {k: max(float(v), 0.0) / total for k, v in merged.items()}
+
+
+def _normalization_summary(components: Dict[str, Any]) -> Dict[str, Any]:
+    normalization = {
+        "scalar": "abs(a - b) / max(abs(a), abs(b), eps)",
+        "vector": "l2 distance normalized by comparison scale",
+        "histogram": "1D Wasserstein distance normalized by histogram support range",
+        "eps": 1e-8,
+        "components": {},
+    }
+    for component, result in components.items():
+        details = result.get("details", {})
+        component_summary = {}
+        if "distance" in details:
+            component_summary["distance"] = {
+                "metric": details["distance"].get("metric"),
+                "normalization_scale": details["distance"].get("normalization_scale"),
+            }
+        if component == "foreground_intensity":
+            component_summary["channels"] = {
+                channel: {
+                    "normalization_scale": channel_details.get("normalization_scale"),
+                    "weight": channel_details.get("weight"),
+                }
+                for channel, channel_details in details.get("channels", {}).items()
+            }
+        if component == "crop":
+            component_summary["distances"] = {
+                key: {
+                    "metric": value.get("metric"),
+                    "normalization_scale": value.get("normalization_scale"),
+                }
+                for key, value in details.items()
+                if isinstance(value, dict)
+            }
+        normalization["components"][component] = component_summary
+    return normalization
 
 
 def _decision_band(overall_distance: float, thresholds: Optional[Dict[str, float]]) -> str:
@@ -385,8 +460,52 @@ def compute_fingerprint_distance(
         "decision_band": _decision_band(overall_distance, thresholds),
         "weights": normalized_weights,
         "thresholds": thresholds,
+        "normalization": _normalization_summary(components),
         "components": components,
         "contributions": contributions,
         "top_contributors": top_contributors,
         "notes": notes,
     }
+
+
+def build_fingerprint_precheck_report(
+    target_client: str,
+    source_round: str,
+    original: Dict[str, Any],
+    excluded: Dict[str, Any],
+    weights: Optional[Dict[str, float]] = None,
+    thresholds: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    report = compute_fingerprint_distance(
+        original,
+        excluded,
+        weights=weights,
+        thresholds=thresholds,
+    )
+    return {
+        "target_client": str(target_client),
+        "source_round": source_round,
+        **report,
+    }
+
+
+def save_fingerprint_precheck_artifacts(
+    artifact_dir: str,
+    report: Dict[str, Any],
+    excluded_fingerprint: Dict[str, Any],
+) -> Dict[str, str]:
+    maybe_mkdir_p(artifact_dir)
+    paths = {
+        "fingerprint_diff": os.path.join(artifact_dir, "fingerprint_diff.json"),
+        "global_fingerprint_without_target": os.path.join(
+            artifact_dir,
+            "global_fingerprint_without_target.json",
+        ),
+    }
+    save_json(report, paths["fingerprint_diff"], sort_keys=False)
+    save_json(
+        excluded_fingerprint,
+        paths["global_fingerprint_without_target"],
+        sort_keys=False,
+    )
+    return paths

@@ -12,6 +12,10 @@ from flwr.common.logger import log
 from flwr.server.client_manager import ClientManager
 from flwr.server.client_proxy import ClientProxy
 
+from fednnunet.fingerprint_diff import (
+    build_fingerprint_precheck_report,
+    save_fingerprint_precheck_artifacts,
+)
 from fednnunet.plan_diff import (
     compute_plan_diff,
     copy_generated_minus_plan,
@@ -174,6 +178,14 @@ def load_latest_local_fingerprints() -> Tuple[str, Dict[str, Dict[str, Any]]]:
     if not fingerprints:
         raise RuntimeError(f"No local client fingerprints found in {round_dir}")
     return round_dir, fingerprints
+
+
+def load_latest_global_fingerprint() -> Dict[str, Any]:
+    history_dir = get_fingerprint_history_dir()
+    fingerprint_path = os.path.join(history_dir, "global_fingerprint_all.json")
+    if not os.path.isfile(fingerprint_path):
+        raise RuntimeError(f"Global fingerprint not found: {fingerprint_path}")
+    return load_json(fingerprint_path)
 
 
 def get_federaser_artifact_dir() -> str:
@@ -604,6 +616,24 @@ class MyStrategy(fl.server.strategy.FedAvg):
             os.path.join(artifact_dir, "global_fingerprint_minus_target.json"),
             sort_keys=False,
         )
+        fingerprint_precheck_dir = os.path.join(
+            get_federaser_artifact_dir(),
+            "plan_unlearning_precheck",
+            f"target_client_{target_client}",
+            source_round_name,
+        )
+        original_fingerprint = load_latest_global_fingerprint()
+        fingerprint_precheck_report = build_fingerprint_precheck_report(
+            target_client=target_client,
+            source_round=source_round_name,
+            original=original_fingerprint,
+            excluded=minus_fingerprint,
+        )
+        fingerprint_precheck_paths = save_fingerprint_precheck_artifacts(
+            fingerprint_precheck_dir,
+            fingerprint_precheck_report,
+            minus_fingerprint,
+        )
 
         minus_plans_identifier = (
             f"{self.plans_identifier}_minus_target_{target_client}_{source_round_name}"
@@ -651,6 +681,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 "artifact_paths": {
                     **paths,
                     "generated_minus_plan_snapshot": generated_plan_snapshot,
+                    "fingerprint_precheck": fingerprint_precheck_paths,
                 },
             },
             os.path.join(artifact_dir, "metadata.json"),
