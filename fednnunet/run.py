@@ -71,6 +71,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="FedEraser calibration ratio. Used by the unlearn task. Default: 0.5.",
     )
+    parser.add_argument(
+        "--tau_fp_low",
+        type=float,
+        default=0.05,
+        help="Fingerprint distance low threshold for planning-aware unlearning policy.",
+    )
+    parser.add_argument(
+        "--tau_plan_low",
+        type=float,
+        default=0.05,
+        help="Plan distance low threshold for planning-aware unlearning policy.",
+    )
+    parser.add_argument(
+        "--tau_plan_high",
+        type=float,
+        default=0.25,
+        help="Plan distance high threshold for planning-aware unlearning policy.",
+    )
 
     return parser
 
@@ -201,7 +219,7 @@ def main():
         gpu_memory_target = args.gpu_memory_target
         if len(gpu_memory_target) != num_clients:
             raise ValueError("gpu_memory_target must have the same length as data_centers")
-        if task != "plan_and_preprocess":
+        if task not in ("plan_and_preprocess", "unlearn"):
             print(
                 f"WARNING: {task} task does not accept gpu_memory_target argument. It will be ignored."
             )
@@ -218,7 +236,29 @@ def main():
     if args.target_client is not None:
         server_optional_args += f" --target_client {args.target_client}"
     if task == "unlearn":
-        server_optional_args += f" --delta_t {args.delta_t} --r {args.r}"
+        server_optional_args += (
+            f" --delta_t {args.delta_t} --r {args.r}"
+            f" --tau_fp_low {args.tau_fp_low}"
+            f" --tau_plan_low {args.tau_plan_low}"
+            f" --tau_plan_high {args.tau_plan_high}"
+        )
+        planning_dataset_id = min(datasets)
+        plan_diff_gpu_memory_target = None
+        if gpu_memory_target_mapping:
+            plan_diff_gpu_memory_target = gpu_memory_target_mapping.get(
+                planning_dataset_id
+            )
+        server_optional_args += (
+            f" --planning_dataset_id {planning_dataset_id}"
+            f" --plans_identifier {get_option_value(unknown, ('-p',), 'nnUNetPlans')}"
+            f" --plan_diff_planner {get_option_value(unknown, ('-pl',), 'ExperimentPlanner')}"
+            f" --plan_diff_preprocessor_name "
+            f"{get_option_value(unknown, ('-preprocessor_name',), 'DefaultPreprocessor')}"
+        )
+        if plan_diff_gpu_memory_target is not None:
+            server_optional_args += (
+                f" --plan_diff_gpu_memory_target {plan_diff_gpu_memory_target}"
+            )
 
     multi_gpu = True
 

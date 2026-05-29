@@ -6,11 +6,30 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import flwr as fl
 import torch
-from batchgenerators.utilities.file_and_folder_operations import maybe_mkdir_p, save_json
+from batchgenerators.utilities.file_and_folder_operations import load_json, maybe_mkdir_p, save_json
 from flwr.common import EvaluateIns, FitIns, MetricsAggregationFn, NDArrays, Parameters, Scalar
 from flwr.common.logger import log
 from flwr.server.client_manager import ClientManager
 from flwr.server.client_proxy import ClientProxy
+
+from fednnunet.fingerprint_diff import (
+    build_fingerprint_precheck_report,
+    save_fingerprint_precheck_artifacts,
+)
+from fednnunet.plan_diff import (
+    compute_plan_diff,
+    copy_generated_minus_plan,
+    generate_plan_from_fingerprint,
+    load_plan,
+    save_plan_diff_artifacts,
+)
+from fednnunet.unlearning_policy import (
+    DEFAULT_TAU_FP_LOW,
+    DEFAULT_TAU_PLAN_HIGH,
+    DEFAULT_TAU_PLAN_LOW,
+    decide_unlearning_policy,
+    save_unlearning_policy_artifact,
+)
 
 
 def state_dict_to_bytes(state_dict) -> bytes:
@@ -136,6 +155,44 @@ def save_global_fingerprint(server_round: int, parameters: Parameters) -> None:
     global_fingerprint = parameters_to_state_dict(parameters)
     save_json(global_fingerprint, os.path.join(round_dir, "global_fingerprint_all.json"))
     save_json(global_fingerprint, os.path.join(history_dir, "global_fingerprint_all.json"))
+
+
+def get_latest_fingerprint_round_dir() -> str:
+    history_dir = get_fingerprint_history_dir()
+    if not os.path.isdir(history_dir):
+        raise RuntimeError(f"Fingerprint history directory does not exist: {history_dir}")
+    round_dirs = [
+        os.path.join(history_dir, entry)
+        for entry in os.listdir(history_dir)
+        if entry.startswith("round_") and os.path.isdir(os.path.join(history_dir, entry))
+    ]
+    if not round_dirs:
+        raise RuntimeError(f"No fingerprint round directories found in {history_dir}")
+    return sorted(round_dirs)[-1]
+
+
+def load_latest_local_fingerprints() -> Tuple[str, Dict[str, Dict[str, Any]]]:
+    round_dir = get_latest_fingerprint_round_dir()
+    fingerprints = {}
+    for entry in sorted(os.listdir(round_dir)):
+        client_dir = os.path.join(round_dir, entry)
+        if not entry.startswith("client_") or not os.path.isdir(client_dir):
+            continue
+        client_id = entry[len("client_") :]
+        fingerprint_path = os.path.join(client_dir, "dataset_fingerprint_local.json")
+        if os.path.isfile(fingerprint_path):
+            fingerprints[client_id] = load_json(fingerprint_path)
+    if not fingerprints:
+        raise RuntimeError(f"No local client fingerprints found in {round_dir}")
+    return round_dir, fingerprints
+
+
+def load_latest_global_fingerprint() -> Dict[str, Any]:
+    history_dir = get_fingerprint_history_dir()
+    fingerprint_path = os.path.join(history_dir, "global_fingerprint_all.json")
+    if not os.path.isfile(fingerprint_path):
+        raise RuntimeError(f"Global fingerprint not found: {fingerprint_path}")
+    return load_json(fingerprint_path)
 
 
 def get_federaser_artifact_dir() -> str:
@@ -474,6 +531,14 @@ class MyStrategy(fl.server.strategy.FedAvg):
         delta_t: int = 2,
         r: float = 0.5,
         total_rounds: int = 1000,
+        planning_dataset_id: Optional[int] = None,
+        plans_identifier: str = "nnUNetPlans",
+        plan_diff_planner: str = "ExperimentPlanner",
+        plan_diff_preprocessor_name: str = "DefaultPreprocessor",
+        plan_diff_gpu_memory_target: Optional[float] = None,
+        tau_fp_low: float = DEFAULT_TAU_FP_LOW,
+        tau_plan_low: float = DEFAULT_TAU_PLAN_LOW,
+        tau_plan_high: float = DEFAULT_TAU_PLAN_HIGH,
         *,
         fraction_fit: float = 1.0,
         fraction_evaluate: float = 1.0,
@@ -515,8 +580,140 @@ class MyStrategy(fl.server.strategy.FedAvg):
         self.delta_t = delta_t
         self.r = r
         self.total_rounds = total_rounds
+        self.planning_dataset_id = planning_dataset_id
+        self.plans_identifier = plans_identifier
+        self.plan_diff_planner = plan_diff_planner
+        self.plan_diff_preprocessor_name = plan_diff_preprocessor_name
+        self.plan_diff_gpu_memory_target = plan_diff_gpu_memory_target
+        self.tau_fp_low = tau_fp_low
+        self.tau_plan_low = tau_plan_low
+        self.tau_plan_high = tau_plan_high
+        self.saved_plan_diff_artifact = False
         self.latest_global_state_dict = None
         self.saved_initial_federaser_checkpoint = False
+
+    def create_unlearning_plan_diff_artifact(self) -> None:
+        if self.saved_plan_diff_artifact:
+            return
+        if self.task != "unlearn" or self.target_client is None:
+            return
+
+        target_client = str(self.target_client)
+        round_dir, fingerprints_by_client = load_latest_local_fingerprints()
+        if target_client not in fingerprints_by_client:
+            raise RuntimeError(
+                f"Target client {target_client} is missing from fingerprint history {round_dir}"
+            )
+
+        retained_fingerprints = [
+            fingerprint
+            for client_id, fingerprint in fingerprints_by_client.items()
+            if client_id != target_client
+        ]
+        if not retained_fingerprints:
+            raise RuntimeError(
+                f"Cannot build minus-target fingerprint: no retained clients after excluding {target_client}"
+            )
+
+        planning_dataset_id = self.planning_dataset_id or self.target_client
+        source_round_name = os.path.basename(round_dir)
+        minus_fingerprint = aggregate_fingerprint_dicts(retained_fingerprints)
+        artifact_dir = os.path.join(
+            get_fingerprint_history_dir(),
+            f"plan_diff_target_{target_client}",
+            source_round_name,
+        )
+        maybe_mkdir_p(artifact_dir)
+        save_json(
+            minus_fingerprint,
+            os.path.join(artifact_dir, "global_fingerprint_minus_target.json"),
+            sort_keys=False,
+        )
+        fingerprint_precheck_dir = os.path.join(
+            get_federaser_artifact_dir(),
+            "plan_unlearning_precheck",
+            f"target_client_{target_client}",
+            source_round_name,
+        )
+        original_fingerprint = load_latest_global_fingerprint()
+        fingerprint_precheck_report = build_fingerprint_precheck_report(
+            target_client=target_client,
+            source_round=source_round_name,
+            original=original_fingerprint,
+            excluded=minus_fingerprint,
+        )
+        fingerprint_precheck_paths = save_fingerprint_precheck_artifacts(
+            fingerprint_precheck_dir,
+            fingerprint_precheck_report,
+            minus_fingerprint,
+        )
+
+        minus_plans_identifier = (
+            f"{self.plans_identifier}_minus_target_{target_client}_{source_round_name}"
+        )
+        original_plan = load_plan(planning_dataset_id, self.plans_identifier)
+        minus_plan = generate_plan_from_fingerprint(
+            planning_dataset_id,
+            minus_fingerprint,
+            minus_plans_identifier,
+            planner_class_name=self.plan_diff_planner,
+            preprocessor_name=self.plan_diff_preprocessor_name,
+            gpu_memory_target_in_gb=self.plan_diff_gpu_memory_target,
+        )
+        plan_diff = compute_plan_diff(
+            original_plan,
+            minus_plan,
+            target_client=target_client,
+            planning_dataset_id=planning_dataset_id,
+            plans_identifier=self.plans_identifier,
+            minus_plans_identifier=minus_plans_identifier,
+        )
+        unlearning_policy = decide_unlearning_policy(
+            fingerprint_precheck_report,
+            plan_diff,
+            tau_fp_low=self.tau_fp_low,
+            tau_plan_low=self.tau_plan_low,
+            tau_plan_high=self.tau_plan_high,
+        )
+        paths = save_plan_diff_artifacts(
+            artifact_dir,
+            original_plan,
+            minus_plan,
+            plan_diff,
+        )
+        policy_path = save_unlearning_policy_artifact(
+            artifact_dir,
+            unlearning_policy,
+        )
+        generated_plan_snapshot = copy_generated_minus_plan(
+            planning_dataset_id,
+            minus_plans_identifier,
+            artifact_dir,
+        )
+        save_json(
+            {
+                "target_client": target_client,
+                "planning_dataset_id": planning_dataset_id,
+                "source_fingerprint_round": round_dir,
+                "source_fingerprint_round_name": source_round_name,
+                "retained_clients": sorted(
+                    client_id
+                    for client_id in fingerprints_by_client
+                    if client_id != target_client
+                ),
+                "excluded_clients": [target_client],
+                "artifact_paths": {
+                    **paths,
+                    "unlearning_policy": policy_path,
+                    "generated_minus_plan_snapshot": generated_plan_snapshot,
+                    "fingerprint_precheck": fingerprint_precheck_paths,
+                },
+            },
+            os.path.join(artifact_dir, "metadata.json"),
+            sort_keys=False,
+        )
+        log(INFO, f"Plan diff artifact saved to {paths['plan_diff']}")
+        self.saved_plan_diff_artifact = True
 
     def should_save_federaser_artifact(self, global_round: int) -> bool:
         return (
@@ -572,6 +769,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
         self, server_round: int, parameters: Parameters, client_manager: ClientManager
     ) -> List[Tuple[ClientProxy, FitIns]]:
         """Configure the next round of training."""
+        self.create_unlearning_plan_diff_artifact()
         config = {}
         if self.task == "extract_fingerprint" or self.task == "plan_and_preprocess":
             if server_round == 1:
@@ -778,6 +976,54 @@ def main() -> None:
         default=0.5,
         help="FedEraser calibration ratio. Used by the unlearn task. Default: 0.5.",
     )
+    parser.add_argument(
+        "--planning_dataset_id",
+        type=int,
+        default=None,
+        help="Dataset id whose nnU-Net dataset context and P_all plan are used for unlearning plan diff.",
+    )
+    parser.add_argument(
+        "--plans_identifier",
+        type=str,
+        default="nnUNetPlans",
+        help="Existing P_all plans identifier used as the plan diff baseline.",
+    )
+    parser.add_argument(
+        "--plan_diff_planner",
+        type=str,
+        default="ExperimentPlanner",
+        help="Experiment planner class used to generate P_minus_target.",
+    )
+    parser.add_argument(
+        "--plan_diff_preprocessor_name",
+        type=str,
+        default="DefaultPreprocessor",
+        help="Preprocessor class name used to generate P_minus_target.",
+    )
+    parser.add_argument(
+        "--plan_diff_gpu_memory_target",
+        type=float,
+        default=None,
+        help="GPU memory target in GB used to generate P_minus_target.",
+    )
+    parser.add_argument(
+        "--tau_fp_low",
+        type=float,
+        default=DEFAULT_TAU_FP_LOW,
+        help="Fingerprint distance low threshold for Level 0 policy decisions.",
+    )
+    parser.add_argument(
+        "--tau_plan_low",
+        type=float,
+        default=DEFAULT_TAU_PLAN_LOW,
+        help="Plan distance low threshold for Level 0 policy decisions.",
+    )
+    parser.add_argument(
+        "--tau_plan_high",
+        type=float,
+        default=DEFAULT_TAU_PLAN_HIGH,
+        help="Plan distance high threshold for Level 2 policy decisions.",
+    )
 
     args = parser.parse_args()
     num_clients = args.num_clients
@@ -810,6 +1056,14 @@ def main() -> None:
         delta_t=args.delta_t,
         r=args.r,
         total_rounds=num_rounds,
+        planning_dataset_id=args.planning_dataset_id,
+        plans_identifier=args.plans_identifier,
+        plan_diff_planner=args.plan_diff_planner,
+        plan_diff_preprocessor_name=args.plan_diff_preprocessor_name,
+        plan_diff_gpu_memory_target=args.plan_diff_gpu_memory_target,
+        tau_fp_low=args.tau_fp_low,
+        tau_plan_low=args.tau_plan_low,
+        tau_plan_high=args.tau_plan_high,
         min_available_clients=num_clients,
         min_fit_clients=num_clients,
         min_evaluate_clients=num_clients,
