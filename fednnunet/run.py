@@ -78,6 +78,60 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override FedEraser local calibration epochs per retained round. Defaults to max(1, round(r)).",
     )
     parser.add_argument(
+        "--unlearning_level",
+        choices=("auto", "0", "1", "2"),
+        default="auto",
+        help="Unlearning level to execute. Default: auto.",
+    )
+    parser.add_argument(
+        "--reuse_preprocessed",
+        action="store_true",
+        default=False,
+        help="Force reuse of existing preprocessed data for Level 1 unlearning.",
+    )
+    parser.add_argument(
+        "--repreprocess_retained",
+        action="store_true",
+        default=False,
+        help="Force retained-client preprocessing for Level 1 unlearning.",
+    )
+    parser.add_argument(
+        "--correction_rounds",
+        type=int,
+        default=0,
+        help="Correction training rounds after FedEraser replay. Default: 0.",
+    )
+    parser.add_argument(
+        "--correction_epochs",
+        type=int,
+        default=1,
+        help="Local epochs per correction round. Default: 1.",
+    )
+    parser.add_argument(
+        "--level2_rounds",
+        type=int,
+        default=None,
+        help="Retained retraining rounds for Level 2. Defaults to max(1, round(r * retained_round_count)).",
+    )
+    parser.add_argument(
+        "--level2_epochs",
+        type=int,
+        default=1,
+        help="Local epochs per Level 2 retained retraining round. Default: 1.",
+    )
+    parser.add_argument(
+        "--level2_transfer_source",
+        choices=("federaser", "initial", "latest", "latest_global", "original", "global"),
+        default="latest_global",
+        help="Checkpoint source for Level 2 compatible weight transfer. Default: latest_global.",
+    )
+    parser.add_argument(
+        "--level2_min_transfer_ratio",
+        type=float,
+        default=0.0,
+        help="Minimum compatible parameter ratio required from retained Level 2 clients. Default: 0.0.",
+    )
+    parser.add_argument(
         "--tau_fp_low",
         type=float,
         default=0.05,
@@ -193,6 +247,17 @@ def save_experiment_config_snapshot(
         "configuration": args.configuration,
         "trainer": get_option_value(unknown, ("-tr",), "nnUNetTrainer"),
         "plans_identifier": get_option_value(unknown, ("-p",), "nnUNetPlans"),
+        "unlearning_args": {
+            "unlearning_level": getattr(args, "unlearning_level", "auto"),
+            "reuse_preprocessed": getattr(args, "reuse_preprocessed", False),
+            "repreprocess_retained": getattr(args, "repreprocess_retained", False),
+            "correction_rounds": getattr(args, "correction_rounds", 0),
+            "correction_epochs": getattr(args, "correction_epochs", 1),
+            "level2_rounds": getattr(args, "level2_rounds", None),
+            "level2_epochs": getattr(args, "level2_epochs", 1),
+            "level2_transfer_source": getattr(args, "level2_transfer_source", "latest_global"),
+            "level2_min_transfer_ratio": getattr(args, "level2_min_transfer_ratio", 0.0),
+        },
         "preprocessing_args": collect_preprocessing_args(args, unknown),
         "server_command": server_command,
         "client_commands": client_commands,
@@ -217,6 +282,16 @@ def main():
         raise ValueError("--target_client must be one of the provided data_centers")
     if args.delta_t <= 0:
         raise ValueError("--delta_t must be a positive integer")
+    if getattr(args, "correction_rounds", 0) < 0:
+        raise ValueError("--correction_rounds must be non-negative")
+    if getattr(args, "correction_epochs", 1) <= 0:
+        raise ValueError("--correction_epochs must be a positive integer")
+    if getattr(args, "level2_rounds", None) is not None and args.level2_rounds <= 0:
+        raise ValueError("--level2_rounds must be a positive integer")
+    if getattr(args, "level2_epochs", 1) <= 0:
+        raise ValueError("--level2_epochs must be a positive integer")
+    if getattr(args, "level2_min_transfer_ratio", 0.0) < 0:
+        raise ValueError("--level2_min_transfer_ratio must be non-negative")
 
     gpu_memory_target = None
     gpu_memory_target_mapping = {}
@@ -247,7 +322,19 @@ def main():
             f" --tau_fp_low {args.tau_fp_low}"
             f" --tau_plan_low {args.tau_plan_low}"
             f" --tau_plan_high {args.tau_plan_high}"
+            f" --unlearning_level {args.unlearning_level}"
+            f" --correction_rounds {args.correction_rounds}"
+            f" --correction_epochs {args.correction_epochs}"
+            f" --level2_epochs {args.level2_epochs}"
+            f" --level2_transfer_source {args.level2_transfer_source}"
+            f" --level2_min_transfer_ratio {args.level2_min_transfer_ratio}"
         )
+        if args.level2_rounds is not None:
+            server_optional_args += f" --level2_rounds {args.level2_rounds}"
+        if args.reuse_preprocessed:
+            server_optional_args += " --reuse_preprocessed"
+        if args.repreprocess_retained:
+            server_optional_args += " --repreprocess_retained"
         if args.calibration_epochs is not None:
             server_optional_args += f" --calibration_epochs {args.calibration_epochs}"
         planning_dataset_id = min(datasets)
@@ -307,6 +394,10 @@ def main():
                     )
                     if args.calibration_epochs is not None:
                         optional_args += f"--calibration_epochs {args.calibration_epochs} "
+                    optional_args += (
+                        f"--correction_epochs {args.correction_epochs} "
+                        f"--level2_epochs {args.level2_epochs} "
+                    )
 
                 if task == "plan_and_preprocess":
                     command = f"{process_prefix} python fednnunet/client.py {client_global_args} {task} -d {client_dataset} {optional_args}"

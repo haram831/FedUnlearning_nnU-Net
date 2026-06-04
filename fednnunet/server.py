@@ -32,9 +32,12 @@ from fednnunet.federaser import (
     subtract_state_dicts as federaser_subtract_state_dicts,
 )
 from fednnunet.plan_diff import (
+    create_architecture_preserving_level1_plan,
     compute_plan_diff,
     copy_generated_minus_plan,
     generate_plan_from_fingerprint,
+    get_plan_path,
+    get_preprocessing_critical_changes,
     load_plan,
     save_plan_diff_artifacts,
 )
@@ -555,6 +558,15 @@ class MyStrategy(fl.server.strategy.FedAvg):
         tau_plan_low: float = DEFAULT_TAU_PLAN_LOW,
         tau_plan_high: float = DEFAULT_TAU_PLAN_HIGH,
         calibration_epochs: Optional[int] = None,
+        unlearning_level: str = "auto",
+        reuse_preprocessed: bool = False,
+        repreprocess_retained: bool = False,
+        correction_rounds: int = 0,
+        correction_epochs: int = 1,
+        level2_rounds: Optional[int] = None,
+        level2_epochs: int = 1,
+        level2_transfer_source: str = "latest_global",
+        level2_min_transfer_ratio: float = 0.0,
         *,
         fraction_fit: float = 1.0,
         fraction_evaluate: float = 1.0,
@@ -609,6 +621,15 @@ class MyStrategy(fl.server.strategy.FedAvg):
             if calibration_epochs is not None
             else max(1, int(round(self.r)))
         )
+        self.unlearning_level = str(unlearning_level)
+        self.reuse_preprocessed = bool(reuse_preprocessed)
+        self.repreprocess_retained = bool(repreprocess_retained)
+        self.correction_rounds = max(0, int(correction_rounds))
+        self.correction_epochs = max(1, int(correction_epochs))
+        self.level2_rounds = None if level2_rounds is None else max(1, int(level2_rounds))
+        self.level2_epochs = max(1, int(level2_epochs))
+        self.level2_transfer_source = str(level2_transfer_source)
+        self.level2_min_transfer_ratio = max(0.0, float(level2_min_transfer_ratio))
         self.saved_plan_diff_artifact = False
         self.latest_global_state_dict = None
         self.saved_initial_federaser_checkpoint = False
@@ -619,6 +640,22 @@ class MyStrategy(fl.server.strategy.FedAvg):
         self.federaser_run_dir = None
         self.federaser_start_time = None
         self.federaser_round_reports = []
+        self.unlearning_phase = "preprocess"
+        self.preprocess_round_done = False
+        self.selected_unlearning_level = None
+        self.unlearning_policy = None
+        self.preprocessing_decision = None
+        self.level1_plans_identifier = None
+        self.level2_plans_identifier = None
+        self.level2_rounds_resolved = None
+        self.retained_client_ids: List[str] = []
+        self.correction_round_reports = []
+        self.level2_transfer_reports = []
+        self.level2_round_reports = []
+        self.final_unlearned_checkpoint_path = None
+        self.final_corrected_checkpoint_path = None
+        self.final_level2_checkpoint_path = None
+        self.level2_transfer_source_report = None
 
     def create_unlearning_plan_diff_artifact(self) -> None:
         if self.saved_plan_diff_artifact:
@@ -688,6 +725,13 @@ class MyStrategy(fl.server.strategy.FedAvg):
             preprocessor_name=self.plan_diff_preprocessor_name,
             gpu_memory_target_in_gb=self.plan_diff_gpu_memory_target,
         )
+        level1_plans_identifier = (
+            f"{self.plans_identifier}_level1_minus_target_{target_client}_{source_round_name}"
+        )
+        level1_plan = create_architecture_preserving_level1_plan(
+            original_plan,
+            minus_plan,
+        )
         plan_diff = compute_plan_diff(
             original_plan,
             minus_plan,
@@ -703,12 +747,78 @@ class MyStrategy(fl.server.strategy.FedAvg):
             tau_plan_low=self.tau_plan_low,
             tau_plan_high=self.tau_plan_high,
         )
+        if self.unlearning_level == "auto":
+            selected_level = int(unlearning_policy["level"])
+        else:
+            selected_level = int(self.unlearning_level)
+        if selected_level == 1 and plan_diff.get("architecture_changed", False):
+            raise RuntimeError("Level 1 unlearning requires architecture-compatible plans")
+        critical_changes = get_preprocessing_critical_changes(plan_diff)
+        should_repreprocess = (
+            selected_level == 1
+            and not self.reuse_preprocessed
+            and (self.repreprocess_retained or bool(critical_changes))
+        )
+        self.selected_unlearning_level = selected_level
+        self.unlearning_policy = unlearning_policy
+        self.level1_plans_identifier = level1_plans_identifier
+        self.level2_plans_identifier = minus_plans_identifier
+        self.retained_client_ids = sorted(
+            client_id
+            for client_id in fingerprints_by_client
+            if client_id != target_client
+        )
+        retained_round_count = len(list_retained_rounds(get_federaser_artifact_dir()))
+        self.level2_rounds_resolved = (
+            self.level2_rounds
+            if self.level2_rounds is not None
+            else max(1, int(round(float(self.r) * retained_round_count)))
+        )
+        self.preprocessing_decision = {
+            "selected_unlearning_level": selected_level,
+            "requested_unlearning_level": self.unlearning_level,
+            "reuse_preprocessed": self.reuse_preprocessed,
+            "repreprocess_retained": self.repreprocess_retained,
+            "critical_changes": critical_changes,
+            "should_repreprocess_retained": should_repreprocess,
+            "plans_identifier": level1_plans_identifier if should_repreprocess else self.plans_identifier,
+            "level2_plans_identifier": minus_plans_identifier,
+            "level2_rounds": self.level2_rounds_resolved,
+            "retained_clients": self.retained_client_ids,
+            "excluded_clients": [target_client],
+        }
         paths = save_plan_diff_artifacts(
             artifact_dir,
             original_plan,
             minus_plan,
             plan_diff,
         )
+        level1_plan_path = os.path.join(artifact_dir, "P_level1_minus_target.json")
+        save_json(level1_plan, level1_plan_path, sort_keys=False)
+        level1_dataset_plan_paths = {}
+        if should_repreprocess:
+            for retained_client_id in self.retained_client_ids:
+                retained_plan_path = get_plan_path(
+                    int(retained_client_id),
+                    level1_plans_identifier,
+                )
+                maybe_mkdir_p(os.path.dirname(retained_plan_path))
+                save_json(level1_plan, retained_plan_path, sort_keys=False)
+                level1_dataset_plan_paths[retained_client_id] = retained_plan_path
+        level2_dataset_plan_paths = {}
+        if selected_level == 2:
+            for retained_client_id in self.retained_client_ids:
+                retained_plan_path = get_plan_path(
+                    int(retained_client_id),
+                    minus_plans_identifier,
+                )
+                maybe_mkdir_p(os.path.dirname(retained_plan_path))
+                save_json(minus_plan, retained_plan_path, sort_keys=False)
+                level2_dataset_plan_paths[retained_client_id] = retained_plan_path
+        minus_fingerprint_path = os.path.join(artifact_dir, "dataset_fingerprint_minus_target.json")
+        save_json(minus_fingerprint, minus_fingerprint_path, sort_keys=False)
+        preprocessing_decision_path = os.path.join(artifact_dir, "preprocessing_decision.json")
+        save_json(self.preprocessing_decision, preprocessing_decision_path, sort_keys=False)
         policy_path = save_unlearning_policy_artifact(
             artifact_dir,
             unlearning_policy,
@@ -733,6 +843,11 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 "artifact_paths": {
                     **paths,
                     "unlearning_policy": policy_path,
+                    "level1_plan": level1_plan_path,
+                    "level1_dataset_plans": level1_dataset_plan_paths,
+                    "level2_dataset_plans": level2_dataset_plan_paths,
+                    "dataset_fingerprint_minus_target": minus_fingerprint_path,
+                    "preprocessing_decision": preprocessing_decision_path,
                     "generated_minus_plan_snapshot": generated_plan_snapshot,
                     "fingerprint_precheck": fingerprint_precheck_paths,
                 },
@@ -741,6 +856,8 @@ class MyStrategy(fl.server.strategy.FedAvg):
             sort_keys=False,
         )
         log(INFO, f"Plan diff artifact saved to {paths['plan_diff']}")
+        if selected_level == 2:
+            self.unlearning_phase = "level2_preprocess"
         self.saved_plan_diff_artifact = True
 
     def initialize_federaser_replay(self) -> None:
@@ -765,15 +882,70 @@ class MyStrategy(fl.server.strategy.FedAvg):
         self.federaser_start_time = start_timer()
         self.federaser_initialized = True
 
+    def initialize_unlearning_run_dir(self) -> None:
+        if self.federaser_run_dir is not None:
+            return
+        artifact_dir = get_federaser_artifact_dir()
+        target_client = str(self.target_client)
+        self.federaser_retained_round_ids = list_retained_rounds(artifact_dir)
+        self.federaser_run_dir = get_unlearning_run_dir(artifact_dir, target_client)
+        maybe_mkdir_p(self.federaser_run_dir)
+        self.federaser_start_time = start_timer()
+
+    def get_level2_transfer_source_state_dict(self) -> Dict[str, torch.Tensor]:
+        artifact_dir = get_federaser_artifact_dir()
+        retained_rounds = list_retained_rounds(artifact_dir)
+        if not retained_rounds:
+            raise RuntimeError("Level 2 unlearning requires at least one retained update round")
+
+        requested_source = self.level2_transfer_source
+        source_kind = requested_source
+        source_round = None
+        if requested_source == "initial":
+            source_round = 0
+            source_state_dict = load_global_checkpoint(artifact_dir, 0)
+        elif requested_source in ("latest", "latest_global", "original", "global"):
+            source_round = retained_rounds[-1]
+            source_state_dict = load_global_checkpoint(artifact_dir, source_round)
+        elif requested_source == "federaser" and self.federaser_current_state_dict is not None:
+            source_state_dict = self.federaser_current_state_dict
+        else:
+            source_kind = "latest_global_fallback"
+            source_round = retained_rounds[-1]
+            source_state_dict = load_global_checkpoint(artifact_dir, source_round)
+
+        self.level2_transfer_source_report = {
+            "requested_source": requested_source,
+            "resolved_source": source_kind,
+            "source_round": source_round,
+        }
+        return source_state_dict
+
     def get_federaser_round_id(self, server_round: int) -> int:
         self.initialize_federaser_replay()
-        index = server_round - 1
+        index = server_round - 2
         if index < 0 or index >= len(self.federaser_retained_round_ids):
             raise RuntimeError(
                 f"FedEraser server_round {server_round} has no retained round. "
                 f"Available retained rounds: {self.federaser_retained_round_ids}"
             )
         return self.federaser_retained_round_ids[index]
+
+    def sample_unlearning_clients(
+        self,
+        client_manager: ClientManager,
+    ) -> List[ClientProxy]:
+        sample_size, min_num_clients = self.num_fit_clients(
+            client_manager.num_available()
+        )
+        clients = client_manager.sample(
+            num_clients=sample_size,
+            min_num_clients=min_num_clients,
+        )
+        if not self.retained_client_ids:
+            return clients
+        retained = [client for client in clients if str(client.cid) in self.retained_client_ids]
+        return retained or clients
 
     def should_save_federaser_artifact(self, global_round: int) -> bool:
         return (
@@ -832,6 +1004,109 @@ class MyStrategy(fl.server.strategy.FedAvg):
         self.create_unlearning_plan_diff_artifact()
         config = {}
         if self.task == "unlearn":
+            if self.unlearning_phase == "level2_preprocess":
+                config.update(
+                    {
+                        "federaser_mode": "level2_preprocess",
+                        "target_client": self.target_client,
+                        "selected_unlearning_level": self.selected_unlearning_level,
+                        "plans_identifier": self.level2_plans_identifier,
+                    }
+                )
+                fit_ins = FitIns(parameters, config)
+                return [
+                    (client, fit_ins)
+                    for client in self.sample_unlearning_clients(client_manager)
+                ]
+
+            if self.unlearning_phase == "level2_transfer":
+                self.initialize_unlearning_run_dir()
+                source_state_dict = self.get_level2_transfer_source_state_dict()
+                config.update(
+                    {
+                        "federaser_mode": "level2_transfer",
+                        "target_client": self.target_client,
+                        "selected_unlearning_level": self.selected_unlearning_level,
+                        "plans_identifier": self.level2_plans_identifier,
+                        "level2_transfer_source": self.level2_transfer_source,
+                    }
+                )
+                fit_ins = FitIns(state_dict_to_parameters(source_state_dict), config)
+                return [
+                    (client, fit_ins)
+                    for client in self.sample_unlearning_clients(client_manager)
+                ]
+
+            if self.unlearning_phase == "level2_retrain":
+                config.update(
+                    {
+                        "federaser_mode": "level2_retrain",
+                        "target_client": self.target_client,
+                        "selected_unlearning_level": self.selected_unlearning_level,
+                        "plans_identifier": self.level2_plans_identifier,
+                        "level2_epochs": self.level2_epochs,
+                    }
+                )
+                fit_ins = FitIns(
+                    state_dict_to_parameters(self.federaser_current_state_dict),
+                    config,
+                )
+                return [
+                    (client, fit_ins)
+                    for client in self.sample_unlearning_clients(client_manager)
+                ]
+
+            if self.unlearning_phase == "preprocess":
+                mode = (
+                    "preprocess_retained"
+                    if self.preprocessing_decision
+                    and self.preprocessing_decision.get("should_repreprocess_retained")
+                    else "preprocess_skip"
+                )
+                config.update(
+                    {
+                        "federaser_mode": mode,
+                        "target_client": self.target_client,
+                        "selected_unlearning_level": self.selected_unlearning_level,
+                        "plans_identifier": (
+                            self.preprocessing_decision or {}
+                        ).get("plans_identifier", self.plans_identifier),
+                    }
+                )
+                fit_ins = FitIns(parameters, config)
+                return [
+                    (client, fit_ins)
+                    for client in self.sample_unlearning_clients(client_manager)
+                ]
+
+            if self.unlearning_phase == "correction":
+                config.update(
+                    {
+                        "federaser_mode": "correction",
+                        "target_client": self.target_client,
+                        "correction_epochs": self.correction_epochs,
+                    }
+                )
+                fit_ins = FitIns(
+                    state_dict_to_parameters(self.federaser_current_state_dict),
+                    config,
+                )
+                return [
+                    (client, fit_ins)
+                    for client in self.sample_unlearning_clients(client_manager)
+                ]
+
+            if self.unlearning_phase == "completed":
+                config.update({"federaser_mode": "preprocess_skip"})
+                fit_ins = FitIns(
+                    state_dict_to_parameters(self.federaser_current_state_dict),
+                    config,
+                )
+                return [
+                    (client, fit_ins)
+                    for client in self.sample_unlearning_clients(client_manager)
+                ]
+
             retained_round_id = self.get_federaser_round_id(server_round)
             self.federaser_current_retained_round_id = retained_round_id
             config.update(
@@ -848,14 +1123,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 state_dict_to_parameters(self.federaser_current_state_dict),
                 config,
             )
-            sample_size, min_num_clients = self.num_fit_clients(
-                client_manager.num_available()
-            )
-            clients = client_manager.sample(
-                num_clients=sample_size,
-                min_num_clients=min_num_clients,
-            )
-            return [(client, fit_ins) for client in clients]
+            return [(client, fit_ins) for client in self.sample_unlearning_clients(client_manager)]
 
         if self.task == "extract_fingerprint" or self.task == "plan_and_preprocess":
             if server_round == 1:
@@ -970,6 +1238,21 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 {},
             )
         if self.task == "unlearn":
+            if self.unlearning_phase == "level2_preprocess":
+                return self.aggregate_level2_preprocess_round(rnd, successful_results)
+            if self.unlearning_phase == "level2_transfer":
+                return self.aggregate_level2_transfer_round(rnd, successful_results)
+            if self.unlearning_phase == "level2_retrain":
+                return self.aggregate_level2_retrain_round(rnd, successful_results)
+            if self.unlearning_phase == "preprocess":
+                return self.aggregate_unlearning_preprocess_round(rnd, successful_results)
+            if self.unlearning_phase == "correction":
+                return self.aggregate_correction_round(rnd, successful_results)
+            if self.unlearning_phase == "completed":
+                return (
+                    state_dict_to_parameters(self.federaser_current_state_dict),
+                    {"unlearning_phase": "completed"},
+                )
             return self.aggregate_federaser_calibration_round(rnd, successful_results)
 
         # Perform aggregation on successful results
@@ -1018,6 +1301,328 @@ class MyStrategy(fl.server.strategy.FedAvg):
 
         # Implement weight aggregation logic
         return state_dict_to_parameters(new_state_dict)
+
+    def weighted_average_state_dicts(
+        self,
+        state_dicts_by_client: Dict[str, Dict[str, torch.Tensor]],
+        num_examples_by_client: Dict[str, int],
+    ) -> Dict[str, torch.Tensor]:
+        if not state_dicts_by_client:
+            raise ValueError("Cannot aggregate an empty state dict set")
+        first_state_dict = next(iter(state_dicts_by_client.values()))
+        total = sum(
+            max(int(num_examples_by_client.get(client_id, 0)), 0)
+            for client_id in state_dicts_by_client
+        )
+        if total <= 0:
+            weights = {
+                client_id: 1.0 / len(state_dicts_by_client)
+                for client_id in state_dicts_by_client
+            }
+        else:
+            weights = {
+                client_id: max(int(num_examples_by_client.get(client_id, 0)), 0) / total
+                for client_id in state_dicts_by_client
+            }
+
+        averaged = {}
+        for key, reference in first_state_dict.items():
+            if not torch.is_tensor(reference):
+                averaged[key] = reference
+                continue
+            if not torch.is_floating_point(reference):
+                averaged[key] = reference.detach().cpu()
+                continue
+            value = torch.zeros_like(reference.detach().cpu(), dtype=reference.detach().cpu().dtype)
+            has_value = False
+            for client_id, state_dict in state_dicts_by_client.items():
+                candidate = state_dict.get(key)
+                if torch.is_tensor(candidate) and candidate.shape == reference.shape:
+                    value += candidate.detach().cpu().to(dtype=value.dtype) * float(weights[client_id])
+                    has_value = True
+            if has_value:
+                averaged[key] = value
+        return averaged
+
+    def aggregate_level2_preprocess_round(
+        self,
+        server_round: int,
+        successful_results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes]],
+    ) -> Tuple[Parameters, Dict[str, fl.common.Scalar]]:
+        used_clients = []
+        skipped_clients = []
+        for client_proxy, fit_res in successful_results:
+            client_id = get_logical_client_id(client_proxy, fit_res)
+            if bool(fit_res.metrics.get("is_target_client", False)):
+                skipped_clients.append(client_id)
+            else:
+                used_clients.append(client_id)
+
+        if not used_clients:
+            raise RuntimeError("No retained clients completed Level 2 preprocessing")
+
+        self.initialize_unlearning_run_dir()
+        self.unlearning_phase = "level2_transfer"
+        metrics = {
+            "unlearning_phase": "level2_preprocess",
+            "level2_preprocess_used_clients": len(used_clients),
+            "level2_preprocess_skipped_clients": len(skipped_clients),
+            "level2_plans_identifier": self.level2_plans_identifier,
+        }
+        return successful_results[0][1].parameters, metrics
+
+    def aggregate_level2_transfer_round(
+        self,
+        server_round: int,
+        successful_results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes]],
+    ) -> Tuple[Parameters, Dict[str, fl.common.Scalar]]:
+        state_dicts = {}
+        num_examples = {}
+        skipped_clients = []
+        transfer_reports = []
+        for client_proxy, fit_res in successful_results:
+            client_id = get_logical_client_id(client_proxy, fit_res)
+            if client_id == str(self.target_client) or bool(fit_res.metrics.get("is_target_client", False)):
+                skipped_clients.append(client_id)
+                continue
+            transfer_ratio = float(fit_res.metrics.get("transfer_ratio", 0.0))
+            if transfer_ratio < self.level2_min_transfer_ratio:
+                skipped_clients.append(client_id)
+                continue
+            state_dicts[client_id] = parameters_to_state_dict(fit_res.parameters)
+            num_examples[client_id] = fit_res.num_examples
+            transfer_reports.append(
+                {
+                    "client_id": client_id,
+                    "transfer_ratio": transfer_ratio,
+                    "transferred_key_count": int(fit_res.metrics.get("transferred_key_count", 0)),
+                    "skipped_key_count": int(fit_res.metrics.get("skipped_key_count", 0)),
+                    "transferred_param_count": int(fit_res.metrics.get("transferred_param_count", 0)),
+                    "total_param_count": int(fit_res.metrics.get("total_param_count", 0)),
+                }
+            )
+
+        if not state_dicts:
+            raise RuntimeError("No retained clients produced Level 2 transfer parameters")
+
+        self.federaser_current_state_dict = self.weighted_average_state_dicts(
+            state_dicts,
+            num_examples,
+        )
+        checkpoint_path = save_unlearned_checkpoint(
+            self.federaser_run_dir,
+            0,
+            self.federaser_current_state_dict,
+        )
+        self.level2_transfer_reports = transfer_reports
+        self.unlearning_phase = "level2_retrain"
+        metrics = {
+            "unlearning_phase": "level2_transfer",
+            "level2_transfer_used_clients": len(state_dicts),
+            "level2_transfer_skipped_clients": len(skipped_clients),
+            "level2_transfer_checkpoint": checkpoint_path,
+        }
+        return state_dict_to_parameters(self.federaser_current_state_dict), metrics
+
+    def aggregate_level2_retrain_round(
+        self,
+        server_round: int,
+        successful_results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes]],
+    ) -> Tuple[Parameters, Dict[str, fl.common.Scalar]]:
+        state_dicts = {}
+        num_examples = {}
+        losses = {}
+        skipped_clients = []
+        for client_proxy, fit_res in successful_results:
+            client_id = get_logical_client_id(client_proxy, fit_res)
+            if client_id == str(self.target_client) or bool(fit_res.metrics.get("is_target_client", False)):
+                skipped_clients.append(client_id)
+                continue
+            state_dicts[client_id] = parameters_to_state_dict(fit_res.parameters)
+            num_examples[client_id] = fit_res.num_examples
+            if "loss" in fit_res.metrics:
+                losses[client_id] = float(fit_res.metrics["loss"])
+
+        if not state_dicts:
+            raise RuntimeError("No retained clients produced Level 2 retraining parameters")
+
+        self.federaser_current_state_dict = self.weighted_average_state_dicts(
+            state_dicts,
+            num_examples,
+        )
+        level2_round = len(self.level2_round_reports) + 1
+        checkpoint_path = save_unlearned_checkpoint(
+            self.federaser_run_dir,
+            level2_round,
+            self.federaser_current_state_dict,
+        )
+        round_report = {
+            "server_round": server_round,
+            "level2_round": level2_round,
+            "used_clients": sorted(state_dicts),
+            "skipped_clients": sorted(set(skipped_clients)),
+            "checkpoint": checkpoint_path,
+            "aggregation": "weighted_by_num_examples",
+            "losses": losses,
+        }
+        self.level2_round_reports.append(round_report)
+
+        final_path = None
+        report_path = None
+        if level2_round >= self.level2_rounds_resolved:
+            final_path = os.path.join(self.federaser_run_dir, "final_level2_unlearned_model.pt")
+            torch.save(self.federaser_current_state_dict, final_path)
+            self.final_level2_checkpoint_path = final_path
+            report = self.build_unlearning_report(
+                output_checkpoint=final_path,
+                report_output_kind="level2",
+            )
+            report_path = save_unlearning_report(self.federaser_run_dir, report)
+            self.unlearning_phase = "completed"
+
+        metrics = {
+            "unlearning_phase": "level2_retrain",
+            "level2_round": level2_round,
+            "level2_used_clients": len(state_dicts),
+            "level2_skipped_clients": len(skipped_clients),
+            "level2_checkpoint": checkpoint_path,
+        }
+        if final_path is not None:
+            metrics["level2_final_checkpoint"] = final_path
+        if report_path is not None:
+            metrics["federaser_report"] = report_path
+        return state_dict_to_parameters(self.federaser_current_state_dict), metrics
+
+    def aggregate_unlearning_preprocess_round(
+        self,
+        server_round: int,
+        successful_results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes]],
+    ) -> Tuple[Parameters, Dict[str, fl.common.Scalar]]:
+        used_clients = []
+        skipped_clients = []
+        for client_proxy, fit_res in successful_results:
+            client_id = get_logical_client_id(client_proxy, fit_res)
+            if bool(fit_res.metrics.get("is_target_client", False)):
+                skipped_clients.append(client_id)
+            else:
+                used_clients.append(client_id)
+
+        self.preprocess_round_done = True
+        self.unlearning_phase = "federaser"
+        metrics = {
+            "unlearning_phase": "preprocess",
+            "preprocess_used_clients": len(used_clients),
+            "preprocess_skipped_clients": len(skipped_clients),
+            "preprocess_reprocessed": bool(
+                self.preprocessing_decision
+                and self.preprocessing_decision.get("should_repreprocess_retained")
+            ),
+        }
+        return successful_results[0][1].parameters, metrics
+
+    def aggregate_correction_round(
+        self,
+        server_round: int,
+        successful_results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes]],
+    ) -> Tuple[Parameters, Dict[str, fl.common.Scalar]]:
+        state_dicts = {}
+        num_examples = {}
+        skipped_clients = []
+        for client_proxy, fit_res in successful_results:
+            client_id = get_logical_client_id(client_proxy, fit_res)
+            if client_id == str(self.target_client) or bool(fit_res.metrics.get("is_target_client", False)):
+                skipped_clients.append(client_id)
+                continue
+            state_dicts[client_id] = parameters_to_state_dict(fit_res.parameters)
+            num_examples[client_id] = fit_res.num_examples
+
+        if not state_dicts:
+            raise RuntimeError("No retained clients produced correction updates")
+
+        self.federaser_current_state_dict = self.weighted_average_state_dicts(
+            state_dicts,
+            num_examples,
+        )
+        correction_index = len(self.correction_round_reports) + 1
+        checkpoint_path = save_unlearned_checkpoint(
+            self.federaser_run_dir,
+            self.federaser_retained_round_ids[-1] + correction_index,
+            self.federaser_current_state_dict,
+        )
+        round_report = {
+            "server_round": server_round,
+            "correction_round": correction_index,
+            "used_clients": sorted(state_dicts),
+            "skipped_clients": sorted(set(skipped_clients)),
+            "checkpoint": checkpoint_path,
+            "aggregation": "weighted_by_num_examples",
+        }
+        self.correction_round_reports.append(round_report)
+
+        final_path = None
+        report_path = None
+        if correction_index >= self.correction_rounds:
+            final_path = os.path.join(self.federaser_run_dir, "final_corrected_unlearned_model.pt")
+            torch.save(self.federaser_current_state_dict, final_path)
+            self.final_corrected_checkpoint_path = final_path
+            report = self.build_unlearning_report(
+                output_checkpoint=final_path,
+                report_output_kind="corrected",
+            )
+            report_path = save_unlearning_report(self.federaser_run_dir, report)
+            self.unlearning_phase = "completed"
+
+        metrics = {
+            "unlearning_phase": "correction",
+            "correction_round": correction_index,
+            "correction_used_clients": len(state_dicts),
+            "correction_skipped_clients": len(skipped_clients),
+            "correction_checkpoint": checkpoint_path,
+        }
+        if final_path is not None:
+            metrics["federaser_final_corrected_checkpoint"] = final_path
+        if report_path is not None:
+            metrics["federaser_report"] = report_path
+        return state_dict_to_parameters(self.federaser_current_state_dict), metrics
+
+    def build_unlearning_report(
+        self,
+        output_checkpoint: Optional[str],
+        report_output_kind: str,
+    ) -> Dict[str, Any]:
+        return {
+            "method": "FedEraser",
+            "target_client_id": str(self.target_client),
+            "excluded_clients": [str(self.target_client)],
+            "retained_clients": self.retained_client_ids,
+            "selected_unlearning_level": self.selected_unlearning_level,
+            "requested_unlearning_level": self.unlearning_level,
+            "unlearning_policy": self.unlearning_policy,
+            "preprocessing_decision": self.preprocessing_decision,
+            "retain_interval": self.delta_t,
+            "calibration_ratio": self.r,
+            "calibration_epochs": self.calibration_epochs,
+            "correction_rounds": self.correction_rounds,
+            "correction_epochs": self.correction_epochs,
+            "level2_rounds": self.level2_rounds_resolved,
+            "level2_epochs": self.level2_epochs,
+            "level2_transfer_source": self.level2_transfer_source_report,
+            "level2_min_transfer_ratio": self.level2_min_transfer_ratio,
+            "num_retained_rounds": len(self.federaser_retained_round_ids),
+            "retained_rounds": self.federaser_retained_round_ids,
+            "rounds": self.federaser_round_reports,
+            "correction": self.correction_round_reports,
+            "level2_transfer": self.level2_transfer_reports,
+            "level2_round_reports": self.level2_round_reports,
+            "unlearning_time_sec": elapsed_seconds(self.federaser_start_time),
+            "output_checkpoint": output_checkpoint,
+            "output_kind": report_output_kind,
+            "aggregation": "weighted_by_retained_num_examples",
+            "notes": [
+                "Calibrated update uses historical retained update norm and current calibration update direction.",
+                "Target client is excluded from calibration and aggregation.",
+            ],
+        }
 
     def aggregate_federaser_calibration_round(
         self,
@@ -1084,7 +1689,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
         }
         self.federaser_round_reports.append(round_report)
 
-        is_last_round = server_round >= len(self.federaser_retained_round_ids)
+        is_last_round = server_round >= len(self.federaser_retained_round_ids) + 1
         final_path = None
         report_path = None
         if is_last_round:
@@ -1092,24 +1697,15 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 self.federaser_run_dir,
                 self.federaser_current_state_dict,
             )
-            report = {
-                "method": "FedEraser",
-                "target_client_id": target_client,
-                "retain_interval": self.delta_t,
-                "calibration_ratio": self.r,
-                "calibration_epochs": self.calibration_epochs,
-                "num_retained_rounds": len(self.federaser_retained_round_ids),
-                "retained_rounds": self.federaser_retained_round_ids,
-                "rounds": self.federaser_round_reports,
-                "unlearning_time_sec": elapsed_seconds(self.federaser_start_time),
-                "output_checkpoint": final_path,
-                "aggregation": "weighted_by_retained_num_examples",
-                "notes": [
-                    "Calibrated update uses historical retained update norm and current calibration update direction.",
-                    "Target client is excluded from calibration and aggregation.",
-                ],
-            }
+            self.final_unlearned_checkpoint_path = final_path
+            report = self.build_unlearning_report(
+                output_checkpoint=final_path,
+                report_output_kind="federaser",
+            )
             report_path = save_unlearning_report(self.federaser_run_dir, report)
+            self.unlearning_phase = (
+                "correction" if self.correction_rounds > 0 else "completed"
+            )
 
         metrics = {
             "federaser_retained_round": retained_round_id,
@@ -1224,6 +1820,60 @@ def main() -> None:
         default=None,
         help="Override local calibration epochs per retained FedEraser round. Defaults to max(1, round(r)).",
     )
+    parser.add_argument(
+        "--unlearning_level",
+        choices=("auto", "0", "1", "2"),
+        default="auto",
+        help="Unlearning level to execute. Default: auto.",
+    )
+    parser.add_argument(
+        "--reuse_preprocessed",
+        action="store_true",
+        default=False,
+        help="Force reuse of existing preprocessed data for Level 1 unlearning.",
+    )
+    parser.add_argument(
+        "--repreprocess_retained",
+        action="store_true",
+        default=False,
+        help="Force retained-client preprocessing for Level 1 unlearning.",
+    )
+    parser.add_argument(
+        "--correction_rounds",
+        type=int,
+        default=0,
+        help="Correction training rounds after FedEraser replay. Default: 0.",
+    )
+    parser.add_argument(
+        "--correction_epochs",
+        type=int,
+        default=1,
+        help="Local epochs per correction round. Default: 1.",
+    )
+    parser.add_argument(
+        "--level2_rounds",
+        type=int,
+        default=None,
+        help="Retained retraining rounds for Level 2. Defaults to max(1, round(r * retained_round_count)).",
+    )
+    parser.add_argument(
+        "--level2_epochs",
+        type=int,
+        default=1,
+        help="Local epochs per Level 2 retained retraining round. Default: 1.",
+    )
+    parser.add_argument(
+        "--level2_transfer_source",
+        choices=("federaser", "initial", "latest", "latest_global", "original", "global"),
+        default="latest_global",
+        help="Checkpoint source for Level 2 compatible weight transfer. Default: latest_global.",
+    )
+    parser.add_argument(
+        "--level2_min_transfer_ratio",
+        type=float,
+        default=0.0,
+        help="Minimum compatible parameter ratio required from retained Level 2 clients. Default: 0.0.",
+    )
 
     args = parser.parse_args()
     num_clients = args.num_clients
@@ -1232,14 +1882,33 @@ def main() -> None:
         raise ValueError("--target_client must be specified for the unlearn task")
     if args.delta_t <= 0:
         raise ValueError("--delta_t must be a positive integer")
+    if args.correction_rounds < 0:
+        raise ValueError("--correction_rounds must be non-negative")
+    if args.correction_epochs <= 0:
+        raise ValueError("--correction_epochs must be a positive integer")
+    if args.level2_rounds is not None and args.level2_rounds <= 0:
+        raise ValueError("--level2_rounds must be a positive integer")
+    if args.level2_epochs <= 0:
+        raise ValueError("--level2_epochs must be a positive integer")
+    if args.level2_min_transfer_ratio < 0:
+        raise ValueError("--level2_min_transfer_ratio must be non-negative")
 
     if args.task == "extract_fingerprint" or args.task == "plan_and_preprocess":
         num_rounds = 2
         fraction_evaluate = 1.0
     elif args.task == "unlearn":
-        num_rounds = len(list_retained_rounds(get_federaser_artifact_dir()))
-        if num_rounds <= 0:
+        retained_round_count = len(list_retained_rounds(get_federaser_artifact_dir()))
+        if retained_round_count <= 0:
             raise ValueError("FedEraser unlearn requires at least one retained update round")
+        level2_rounds = (
+            args.level2_rounds
+            if args.level2_rounds is not None
+            else max(1, int(round(float(args.r) * retained_round_count)))
+        )
+        num_rounds = max(
+            1 + retained_round_count + args.correction_rounds,
+            2 + level2_rounds,
+        )
         fraction_evaluate = 0.0
     else:
         # nnUNet's default training length
@@ -1270,6 +1939,15 @@ def main() -> None:
         tau_plan_low=args.tau_plan_low,
         tau_plan_high=args.tau_plan_high,
         calibration_epochs=args.calibration_epochs,
+        unlearning_level=args.unlearning_level,
+        reuse_preprocessed=args.reuse_preprocessed,
+        repreprocess_retained=args.repreprocess_retained,
+        correction_rounds=args.correction_rounds,
+        correction_epochs=args.correction_epochs,
+        level2_rounds=args.level2_rounds,
+        level2_epochs=args.level2_epochs,
+        level2_transfer_source=args.level2_transfer_source,
+        level2_min_transfer_ratio=args.level2_min_transfer_ratio,
         min_available_clients=num_clients,
         min_fit_clients=num_clients,
         min_evaluate_clients=num_clients,
