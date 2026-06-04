@@ -99,6 +99,7 @@ class FlowerClient(fl.client.Client):
             self.is_target_client = getattr(args, "is_target_client", False)
             self.delta_t = getattr(args, "delta_t", None)
             self.r = getattr(args, "r", None)
+            self.calibration_epochs = getattr(args, "calibration_epochs", 1)
             # this calls run_training but is not running any training, I did not change the name of the method for compatibility with regular nnUnet.
             self.trainer = run_training(
                 args.dataset_name_or_id,
@@ -281,6 +282,7 @@ class FlowerClient(fl.client.Client):
 
     def fit(self, fi):
         self.set_parameters(fi.parameters)
+        config = self.get_config(fi)
 
         if self.extract_fingerprint:
             return FitRes(
@@ -291,6 +293,52 @@ class FlowerClient(fl.client.Client):
                     "client_id": self.client_id,
                     "dataset_id": self.dataset_id,
                     "dataset_name": self.dataset_name,
+                },
+            )
+        elif config.get("federaser_mode") == "calibration":
+            if self.is_target_client:
+                return FitRes(
+                    parameters=self.get_parameters({}).parameters,
+                    status=Status(code=Code(0), message="Target client skipped FedEraser calibration"),
+                    num_examples=0,
+                    metrics={
+                        "client_id": self.client_id,
+                        "dataset_id": self.dataset_id,
+                        "dataset_name": self.dataset_name,
+                        "is_target_client": True,
+                        "federaser_mode": "calibration",
+                        "skipped": True,
+                    },
+                )
+
+            calibration_epochs = max(1, int(config.get("calibration_epochs", 1)))
+            try:
+                for _ in range(calibration_epochs):
+                    self.trainer.run_federated_train_round()
+            except ValueError as e:
+                logging.error(f"ValueError occurred during FedEraser calibration: {e}")
+            except RuntimeError as e:
+                logging.error(f"RuntimeError occurred during FedEraser calibration: {e}")
+            except Exception as e:
+                logging.error(f"Unexpected error during FedEraser calibration: {e}")
+                raise
+
+            losses = self.trainer.logger.my_fantastic_logging["train_losses"]
+            loss = float(np.round(losses[-1], decimals=4)) if losses else 0.0
+            return FitRes(
+                parameters=self.get_parameters({}).parameters,
+                status=Status(code=Code(0), message="FedEraser calibration complete"),
+                num_examples=self.get_num_training_examples(),
+                metrics={
+                    "client_id": self.client_id,
+                    "dataset_id": self.dataset_id,
+                    "dataset_name": self.dataset_name,
+                    "loss": loss,
+                    "is_target_client": False,
+                    "federaser_mode": "calibration",
+                    "calibration_epochs": calibration_epochs,
+                    "delta_t": self.delta_t,
+                    "r": self.r,
                 },
             )
         else:

@@ -16,6 +16,21 @@ from fednnunet.fingerprint_diff import (
     build_fingerprint_precheck_report,
     save_fingerprint_precheck_artifacts,
 )
+from fednnunet.federaser import (
+    aggregate_updates as federaser_aggregate_updates,
+    apply_update as federaser_apply_update,
+    calibrate_update,
+    elapsed_seconds,
+    get_unlearning_run_dir,
+    list_retained_rounds,
+    load_global_checkpoint,
+    load_retained_round,
+    save_final_unlearned_model,
+    save_unlearned_checkpoint,
+    save_unlearning_report,
+    start_timer,
+    subtract_state_dicts as federaser_subtract_state_dicts,
+)
 from fednnunet.plan_diff import (
     compute_plan_diff,
     copy_generated_minus_plan,
@@ -539,6 +554,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
         tau_fp_low: float = DEFAULT_TAU_FP_LOW,
         tau_plan_low: float = DEFAULT_TAU_PLAN_LOW,
         tau_plan_high: float = DEFAULT_TAU_PLAN_HIGH,
+        calibration_epochs: Optional[int] = None,
         *,
         fraction_fit: float = 1.0,
         fraction_evaluate: float = 1.0,
@@ -588,9 +604,21 @@ class MyStrategy(fl.server.strategy.FedAvg):
         self.tau_fp_low = tau_fp_low
         self.tau_plan_low = tau_plan_low
         self.tau_plan_high = tau_plan_high
+        self.calibration_epochs = (
+            max(1, int(calibration_epochs))
+            if calibration_epochs is not None
+            else max(1, int(round(self.r)))
+        )
         self.saved_plan_diff_artifact = False
         self.latest_global_state_dict = None
         self.saved_initial_federaser_checkpoint = False
+        self.federaser_initialized = False
+        self.federaser_current_state_dict = None
+        self.federaser_retained_round_ids: List[int] = []
+        self.federaser_current_retained_round_id = None
+        self.federaser_run_dir = None
+        self.federaser_start_time = None
+        self.federaser_round_reports = []
 
     def create_unlearning_plan_diff_artifact(self) -> None:
         if self.saved_plan_diff_artifact:
@@ -715,6 +743,38 @@ class MyStrategy(fl.server.strategy.FedAvg):
         log(INFO, f"Plan diff artifact saved to {paths['plan_diff']}")
         self.saved_plan_diff_artifact = True
 
+    def initialize_federaser_replay(self) -> None:
+        if self.federaser_initialized:
+            return
+        if self.task != "unlearn" or self.target_client is None:
+            return
+
+        artifact_dir = get_federaser_artifact_dir()
+        target_client = str(self.target_client)
+        self.federaser_retained_round_ids = list_retained_rounds(artifact_dir)
+        if not self.federaser_retained_round_ids:
+            raise RuntimeError("FedEraser requires at least one retained client update round")
+        self.federaser_current_state_dict = load_global_checkpoint(artifact_dir, 0)
+        self.federaser_run_dir = get_unlearning_run_dir(artifact_dir, target_client)
+        maybe_mkdir_p(self.federaser_run_dir)
+        save_unlearned_checkpoint(
+            self.federaser_run_dir,
+            0,
+            self.federaser_current_state_dict,
+        )
+        self.federaser_start_time = start_timer()
+        self.federaser_initialized = True
+
+    def get_federaser_round_id(self, server_round: int) -> int:
+        self.initialize_federaser_replay()
+        index = server_round - 1
+        if index < 0 or index >= len(self.federaser_retained_round_ids):
+            raise RuntimeError(
+                f"FedEraser server_round {server_round} has no retained round. "
+                f"Available retained rounds: {self.federaser_retained_round_ids}"
+            )
+        return self.federaser_retained_round_ids[index]
+
     def should_save_federaser_artifact(self, global_round: int) -> bool:
         return (
             global_round == 0
@@ -771,6 +831,32 @@ class MyStrategy(fl.server.strategy.FedAvg):
         """Configure the next round of training."""
         self.create_unlearning_plan_diff_artifact()
         config = {}
+        if self.task == "unlearn":
+            retained_round_id = self.get_federaser_round_id(server_round)
+            self.federaser_current_retained_round_id = retained_round_id
+            config.update(
+                {
+                    "federaser_mode": "calibration",
+                    "retained_round_id": retained_round_id,
+                    "target_client": self.target_client,
+                    "delta_t": self.delta_t,
+                    "r": self.r,
+                    "calibration_epochs": self.calibration_epochs,
+                }
+            )
+            fit_ins = FitIns(
+                state_dict_to_parameters(self.federaser_current_state_dict),
+                config,
+            )
+            sample_size, min_num_clients = self.num_fit_clients(
+                client_manager.num_available()
+            )
+            clients = client_manager.sample(
+                num_clients=sample_size,
+                min_num_clients=min_num_clients,
+            )
+            return [(client, fit_ins) for client in clients]
+
         if self.task == "extract_fingerprint" or self.task == "plan_and_preprocess":
             if server_round == 1:
                 config.update(get_federated_fingerprint_stats_config())
@@ -883,6 +969,9 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 aggregated_fingerprint,
                 {},
             )
+        if self.task == "unlearn":
+            return self.aggregate_federaser_calibration_round(rnd, successful_results)
+
         # Perform aggregation on successful results
         save_aggregation_metadata(rnd, successful_results)
         if self.should_save_federaser_artifact(rnd) and self.latest_global_state_dict is not None:
@@ -929,6 +1018,111 @@ class MyStrategy(fl.server.strategy.FedAvg):
 
         # Implement weight aggregation logic
         return state_dict_to_parameters(new_state_dict)
+
+    def aggregate_federaser_calibration_round(
+        self,
+        server_round: int,
+        successful_results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes]],
+    ) -> Tuple[Parameters, Dict[str, fl.common.Scalar]]:
+        self.initialize_federaser_replay()
+        retained_round_id = self.get_federaser_round_id(server_round)
+        retained_round = load_retained_round(get_federaser_artifact_dir(), retained_round_id)
+        target_client = str(self.target_client)
+
+        calibrated_updates = {}
+        num_examples = {}
+        skipped_clients = []
+        used_clients = []
+        for client_proxy, fit_res in successful_results:
+            client_id = get_logical_client_id(client_proxy, fit_res)
+            if client_id == target_client or bool(fit_res.metrics.get("is_target_client", False)):
+                skipped_clients.append(client_id)
+                continue
+            if client_id not in retained_round.client_updates:
+                skipped_clients.append(client_id)
+                continue
+
+            local_state_dict = parameters_to_state_dict(fit_res.parameters)
+            current_update = federaser_subtract_state_dicts(
+                local_state_dict,
+                self.federaser_current_state_dict,
+            )
+            retained_record = retained_round.client_updates[client_id]
+            calibrated_updates[client_id] = calibrate_update(
+                retained_record.update,
+                current_update,
+            )
+            num_examples[client_id] = retained_record.num_examples
+            used_clients.append(client_id)
+
+        if not calibrated_updates:
+            raise RuntimeError(
+                f"No retained clients produced FedEraser calibration updates for round {retained_round_id}"
+            )
+
+        aggregated_update = federaser_aggregate_updates(
+            calibrated_updates,
+            num_examples,
+            aggregation="weighted",
+        )
+        self.federaser_current_state_dict = federaser_apply_update(
+            self.federaser_current_state_dict,
+            aggregated_update,
+        )
+        checkpoint_path = save_unlearned_checkpoint(
+            self.federaser_run_dir,
+            retained_round_id,
+            self.federaser_current_state_dict,
+        )
+        round_report = {
+            "server_round": server_round,
+            "retained_round": retained_round_id,
+            "used_clients": sorted(used_clients),
+            "skipped_clients": sorted(set(skipped_clients)),
+            "checkpoint": checkpoint_path,
+            "aggregation": "weighted_by_retained_num_examples",
+        }
+        self.federaser_round_reports.append(round_report)
+
+        is_last_round = server_round >= len(self.federaser_retained_round_ids)
+        final_path = None
+        report_path = None
+        if is_last_round:
+            final_path = save_final_unlearned_model(
+                self.federaser_run_dir,
+                self.federaser_current_state_dict,
+            )
+            report = {
+                "method": "FedEraser",
+                "target_client_id": target_client,
+                "retain_interval": self.delta_t,
+                "calibration_ratio": self.r,
+                "calibration_epochs": self.calibration_epochs,
+                "num_retained_rounds": len(self.federaser_retained_round_ids),
+                "retained_rounds": self.federaser_retained_round_ids,
+                "rounds": self.federaser_round_reports,
+                "unlearning_time_sec": elapsed_seconds(self.federaser_start_time),
+                "output_checkpoint": final_path,
+                "aggregation": "weighted_by_retained_num_examples",
+                "notes": [
+                    "Calibrated update uses historical retained update norm and current calibration update direction.",
+                    "Target client is excluded from calibration and aggregation.",
+                ],
+            }
+            report_path = save_unlearning_report(self.federaser_run_dir, report)
+
+        metrics = {
+            "federaser_retained_round": retained_round_id,
+            "federaser_used_clients": len(used_clients),
+            "federaser_skipped_clients": len(skipped_clients),
+            "federaser_checkpoint": checkpoint_path,
+        }
+        if final_path is not None:
+            metrics["federaser_final_checkpoint"] = final_path
+        if report_path is not None:
+            metrics["federaser_report"] = report_path
+
+        return state_dict_to_parameters(self.federaser_current_state_dict), metrics
 
 
 def main() -> None:
@@ -1024,6 +1218,12 @@ def main() -> None:
         default=DEFAULT_TAU_PLAN_HIGH,
         help="Plan distance high threshold for Level 2 policy decisions.",
     )
+    parser.add_argument(
+        "--calibration_epochs",
+        type=int,
+        default=None,
+        help="Override local calibration epochs per retained FedEraser round. Defaults to max(1, round(r)).",
+    )
 
     args = parser.parse_args()
     num_clients = args.num_clients
@@ -1036,6 +1236,11 @@ def main() -> None:
     if args.task == "extract_fingerprint" or args.task == "plan_and_preprocess":
         num_rounds = 2
         fraction_evaluate = 1.0
+    elif args.task == "unlearn":
+        num_rounds = len(list_retained_rounds(get_federaser_artifact_dir()))
+        if num_rounds <= 0:
+            raise ValueError("FedEraser unlearn requires at least one retained update round")
+        fraction_evaluate = 0.0
     else:
         # nnUNet's default training length
         num_rounds = 1000
@@ -1064,6 +1269,7 @@ def main() -> None:
         tau_fp_low=args.tau_fp_low,
         tau_plan_low=args.tau_plan_low,
         tau_plan_high=args.tau_plan_high,
+        calibration_epochs=args.calibration_epochs,
         min_available_clients=num_clients,
         min_fit_clients=num_clients,
         min_evaluate_clients=num_clients,

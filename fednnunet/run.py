@@ -72,6 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="FedEraser calibration ratio. Used by the unlearn task. Default: 0.5.",
     )
     parser.add_argument(
+        "--calibration_epochs",
+        type=int,
+        default=None,
+        help="Override FedEraser local calibration epochs per retained round. Defaults to max(1, round(r)).",
+    )
+    parser.add_argument(
         "--tau_fp_low",
         type=float,
         default=0.05,
@@ -242,6 +248,8 @@ def main():
             f" --tau_plan_low {args.tau_plan_low}"
             f" --tau_plan_high {args.tau_plan_high}"
         )
+        if args.calibration_epochs is not None:
+            server_optional_args += f" --calibration_epochs {args.calibration_epochs}"
         planning_dataset_id = min(datasets)
         plan_diff_gpu_memory_target = None
         if gpu_memory_target_mapping:
@@ -294,7 +302,11 @@ def main():
                 if task == "unlearn" and client_dataset == args.target_client:
                     optional_args += "--is_target_client "
                 if task == "unlearn":
-                    optional_args += f"--delta_t {args.delta_t} --r {args.r} "
+                    optional_args += (
+                        f"--delta_t {args.delta_t} --r {args.r} "
+                    )
+                    if args.calibration_epochs is not None:
+                        optional_args += f"--calibration_epochs {args.calibration_epochs} "
 
                 if task == "plan_and_preprocess":
                     command = f"{process_prefix} python fednnunet/client.py {client_global_args} {task} -d {client_dataset} {optional_args}"

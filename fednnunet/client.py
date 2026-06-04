@@ -124,6 +124,12 @@ def add_unlearning_arguments(parser_unlearn: argparse.ArgumentParser) -> None:
         default=0.5,
         help="[OPTIONAL] FedEraser calibration ratio. Default: 0.5.",
     )
+    parser_unlearn.add_argument(
+        "--calibration_epochs",
+        type=int,
+        default=None,
+        help="[OPTIONAL] Override FedEraser local calibration epochs. Defaults to max(1, round(r)).",
+    )
 
 
 def add_fingerprint_arguments(parser_fingerprint: argparse.ArgumentParser) -> None:
