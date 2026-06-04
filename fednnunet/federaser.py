@@ -136,7 +136,7 @@ def load_global_checkpoint(artifact_dir: str, round_id: int) -> Dict[str, torch.
     )
     if not os.path.isfile(checkpoint_path):
         raise RuntimeError(f"Global checkpoint not found: {checkpoint_path}")
-    return torch.load(checkpoint_path, map_location="cpu")
+    return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
 
 def list_retained_rounds(artifact_dir: str) -> List[int]:
@@ -166,7 +166,7 @@ def load_retained_round(artifact_dir: str, round_id: int) -> RetainedRound:
         update_path = metadata["client_update"]
         client_updates[client_id] = ClientUpdateRecord(
             client_id=client_id,
-            update=torch.load(update_path, map_location="cpu"),
+            update=torch.load(update_path, map_location="cpu", weights_only=False),
             num_examples=int(metadata.get("num_examples", 0)),
             update_path=update_path,
         )
