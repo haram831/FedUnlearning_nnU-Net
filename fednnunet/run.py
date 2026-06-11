@@ -54,6 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of federated training rounds to run on the server.",
     )
     parser.add_argument(
+        "--clients_per_round",
+        type=int,
+        default=None,
+        help="Number of clients to train in each federated round. Defaults to all clients.",
+    )
+    parser.add_argument(
         "--target_client",
         type=int,
         default=None,
@@ -248,6 +254,7 @@ def save_experiment_config_snapshot(
         "trainer": get_option_value(unknown, ("-tr",), "nnUNetTrainer"),
         "plans_identifier": get_option_value(unknown, ("-p",), "nnUNetPlans"),
         "unlearning_args": {
+            "clients_per_round": getattr(args, "clients_per_round", None),
             "unlearning_level": getattr(args, "unlearning_level", "auto"),
             "reuse_preprocessed": getattr(args, "reuse_preprocessed", False),
             "repreprocess_retained": getattr(args, "repreprocess_retained", False),
@@ -292,6 +299,11 @@ def main():
         raise ValueError("--level2_epochs must be a positive integer")
     if getattr(args, "level2_min_transfer_ratio", 0.0) < 0:
         raise ValueError("--level2_min_transfer_ratio must be non-negative")
+    if args.clients_per_round is not None:
+        if args.clients_per_round <= 0:
+            raise ValueError("--clients_per_round must be a positive integer")
+        if args.clients_per_round > num_clients:
+            raise ValueError("--clients_per_round cannot exceed the number of data_centers")
 
     gpu_memory_target = None
     gpu_memory_target_mapping = {}
@@ -314,6 +326,8 @@ def main():
     server_optional_args = ""
     if args.num_rounds is not None:
         server_optional_args += f" --num_rounds {args.num_rounds}"
+    if args.clients_per_round is not None:
+        server_optional_args += f" --clients_per_round {args.clients_per_round}"
     if args.target_client is not None:
         server_optional_args += f" --target_client {args.target_client}"
     if task == "unlearn":

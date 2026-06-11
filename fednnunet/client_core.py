@@ -75,6 +75,34 @@ def parse_bool(value: Any) -> bool:
     return bool(value)
 
 
+def add_metric_if_not_none(metrics: Dict[str, Any], key: str, value: Any) -> None:
+    if value is not None:
+        metrics[key] = value
+
+
+def sanitize_flower_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized: Dict[str, Any] = {}
+    for key, value in metrics.items():
+        if value is None:
+            continue
+        if isinstance(value, np.generic):
+            value = value.item()
+        elif isinstance(value, (list, tuple)):
+            value = [
+                item.item() if isinstance(item, np.generic) else item
+                for item in value
+                if item is not None
+            ]
+        sanitized[key] = value
+    return sanitized
+
+
+def make_fit_res(**kwargs: Any) -> FitRes:
+    if "metrics" in kwargs:
+        kwargs["metrics"] = sanitize_flower_metrics(kwargs["metrics"])
+    return FitRes(**kwargs)
+
+
 class FlowerClient(fl.client.Client):
 
     def __init__(
@@ -95,37 +123,17 @@ class FlowerClient(fl.client.Client):
         self.preprocess_dataset = False
 
         self.train = False
+        self.trainer = None
+        self.model = None
+        self.current_plans_identifier = None
         if self.task in ("train", "unlearn"):
             self.train = True
-            self.is_target_client = getattr(args, "is_target_client", False)
+            self.is_target_client = bool(getattr(args, "is_target_client", False))
             self.delta_t = getattr(args, "delta_t", None)
             self.r = getattr(args, "r", None)
             self.calibration_epochs = getattr(args, "calibration_epochs", 1)
             self.correction_epochs = getattr(args, "correction_epochs", 1)
             self.level2_epochs = getattr(args, "level2_epochs", 1)
-            # this calls run_training but is not running any training, I did not change the name of the method for compatibility with regular nnUnet.
-            self.trainer = run_training(
-                args.dataset_name_or_id,
-                args.configuration,
-                args.fold,
-                args.tr,
-                args.p,
-                args.pretrained_weights,
-                args.num_gpus,
-                args.use_compressed,
-                args.npz,
-                args.c,
-                args.val,
-                args.disable_checkpointing,
-                args.val_best,
-                device=device,
-                return_trainer=True,
-            )
-
-            self.trainer.initialize()
-            self.model = self.trainer.network
-            self.trainer.on_train_start()
-            self.current_plans_identifier = args.p
 
         if self.task == "plan_and_preprocess":
             self.extract_fingerprint = True
@@ -152,20 +160,22 @@ class FlowerClient(fl.client.Client):
         self.preprocessed_output_folder = join(nnUNet_preprocessed, self.dataset_name)
 
     def ensure_training_context(self, plans_identifier: str) -> None:
+        plans_identifier = plans_identifier or getattr(self.args, "p", "nnUNetPlans")
         if getattr(self, "current_plans_identifier", None) == plans_identifier:
             return
 
+        is_default_plan = plans_identifier == getattr(self.args, "p", "nnUNetPlans")
         self.trainer = run_training(
             self.args.dataset_name_or_id,
             self.args.configuration,
             self.args.fold,
             self.args.tr,
             plans_identifier,
-            None,
+            self.args.pretrained_weights if is_default_plan else None,
             self.args.num_gpus,
             self.args.use_compressed,
             self.args.npz,
-            False,
+            self.args.c if is_default_plan else False,
             self.args.val,
             self.args.disable_checkpointing,
             self.args.val_best,
@@ -233,6 +243,7 @@ class FlowerClient(fl.client.Client):
         return target_state_dict
 
     def get_num_training_examples(self):
+        self.ensure_training_context(getattr(self.args, "p", "nnUNetPlans"))
         dataloader = self.trainer.dataloader_train
         if hasattr(dataloader, "indices"):
             return len(dataloader.indices)
@@ -321,6 +332,7 @@ class FlowerClient(fl.client.Client):
             parameters = self.get_fingerprint(self.get_config(fi))
             # print(f'Fingerprint with mean: {self.fingerprint["median_relative_size_after_cropping"]}')
         else:
+            self.ensure_training_context(getattr(self.args, "p", "nnUNetPlans"))
             parameters = self.model.state_dict()
 
         parm = GetParametersRes(
@@ -336,6 +348,7 @@ class FlowerClient(fl.client.Client):
         if self.extract_fingerprint:
             self.fingerprint = common_state_dict
         else:
+            self.ensure_training_context(getattr(self.args, "p", "nnUNetPlans"))
             # torch.save(common_state_dict,os.path.join(os.path.dirname(os.path.abspath(__file__)),'common_state_dict.arch'))
             # torch.save(self.model.state_dict(),os.path.join(os.path.dirname(os.path.abspath(__file__)),'local_state_dict.arch'))
 
@@ -354,7 +367,7 @@ class FlowerClient(fl.client.Client):
             self.set_parameters(fi.parameters)
 
         if self.extract_fingerprint:
-            return FitRes(
+            return make_fit_res(
                 parameters=self.get_parameters(fi).parameters,
                 status=Status(code=Code(0), message="Fingerprint extracted"),
                 num_examples=0,
@@ -366,7 +379,7 @@ class FlowerClient(fl.client.Client):
             )
         elif config.get("federaser_mode") == "calibration":
             if self.is_target_client:
-                return FitRes(
+                return make_fit_res(
                     parameters=self.get_parameters({}).parameters,
                     status=Status(code=Code(0), message="Target client skipped FedEraser calibration"),
                     num_examples=0,
@@ -394,25 +407,26 @@ class FlowerClient(fl.client.Client):
 
             losses = self.trainer.logger.my_fantastic_logging["train_losses"]
             loss = float(np.round(losses[-1], decimals=4)) if losses else 0.0
-            return FitRes(
+            metrics = {
+                "client_id": self.client_id,
+                "dataset_id": self.dataset_id,
+                "dataset_name": self.dataset_name,
+                "loss": loss,
+                "is_target_client": False,
+                "federaser_mode": "calibration",
+                "calibration_epochs": calibration_epochs,
+            }
+            add_metric_if_not_none(metrics, "delta_t", self.delta_t)
+            add_metric_if_not_none(metrics, "r", self.r)
+            return make_fit_res(
                 parameters=self.get_parameters({}).parameters,
                 status=Status(code=Code(0), message="FedEraser calibration complete"),
                 num_examples=self.get_num_training_examples(),
-                metrics={
-                    "client_id": self.client_id,
-                    "dataset_id": self.dataset_id,
-                    "dataset_name": self.dataset_name,
-                    "loss": loss,
-                    "is_target_client": False,
-                    "federaser_mode": "calibration",
-                    "calibration_epochs": calibration_epochs,
-                    "delta_t": self.delta_t,
-                    "r": self.r,
-                },
+                metrics=metrics,
             )
         elif config.get("federaser_mode") == "level2_preprocess":
             if self.is_target_client:
-                return FitRes(
+                return make_fit_res(
                     parameters=self.get_parameters({}).parameters,
                     status=Status(code=Code(0), message="Target client skipped Level 2 preprocessing"),
                     num_examples=0,
@@ -446,7 +460,7 @@ class FlowerClient(fl.client.Client):
                 num_processes=num_processes,
                 verbose=getattr(self.args, "verbose", False),
             )
-            return FitRes(
+            return make_fit_res(
                 parameters=self.get_parameters({}).parameters,
                 status=Status(code=Code(0), message="Level 2 retained preprocessing complete"),
                 num_examples=0,
@@ -462,7 +476,7 @@ class FlowerClient(fl.client.Client):
             )
         elif config.get("federaser_mode") == "level2_transfer":
             if self.is_target_client:
-                return FitRes(
+                return make_fit_res(
                     parameters=self.get_parameters({}).parameters,
                     status=Status(code=Code(0), message="Target client skipped Level 2 transfer"),
                     num_examples=0,
@@ -481,7 +495,7 @@ class FlowerClient(fl.client.Client):
             transfer_report = self.partial_transfer_state_dict(
                 parameters_to_state_dict(fi.parameters)
             )
-            return FitRes(
+            return make_fit_res(
                 parameters=self.get_parameters({}).parameters,
                 status=Status(code=Code(0), message="Level 2 compatible transfer complete"),
                 num_examples=self.get_num_training_examples(),
@@ -502,7 +516,7 @@ class FlowerClient(fl.client.Client):
             )
         elif config.get("federaser_mode") == "level2_retrain":
             if self.is_target_client:
-                return FitRes(
+                return make_fit_res(
                     parameters=self.get_parameters({}).parameters,
                     status=Status(code=Code(0), message="Target client skipped Level 2 retraining"),
                     num_examples=0,
@@ -530,7 +544,7 @@ class FlowerClient(fl.client.Client):
 
             losses = self.trainer.logger.my_fantastic_logging["train_losses"]
             loss = float(np.round(losses[-1], decimals=4)) if losses else 0.0
-            return FitRes(
+            return make_fit_res(
                 parameters=self.get_parameters({}).parameters,
                 status=Status(code=Code(0), message="Level 2 retraining complete"),
                 num_examples=self.get_num_training_examples(),
@@ -546,7 +560,7 @@ class FlowerClient(fl.client.Client):
             )
         elif config.get("federaser_mode") == "preprocess_retained":
             if self.is_target_client:
-                return FitRes(
+                return make_fit_res(
                     parameters=self.get_parameters({}).parameters,
                     status=Status(code=Code(0), message="Target client skipped retained preprocessing"),
                     num_examples=0,
@@ -580,7 +594,7 @@ class FlowerClient(fl.client.Client):
                 num_processes=num_processes,
                 verbose=getattr(self.args, "verbose", False),
             )
-            return FitRes(
+            return make_fit_res(
                 parameters=self.get_parameters({}).parameters,
                 status=Status(code=Code(0), message="Retained preprocessing complete"),
                 num_examples=0,
@@ -595,7 +609,7 @@ class FlowerClient(fl.client.Client):
                 },
             )
         elif config.get("federaser_mode") == "preprocess_skip":
-            return FitRes(
+            return make_fit_res(
                 parameters=self.get_parameters({}).parameters,
                 status=Status(code=Code(0), message="Retained preprocessing skipped"),
                 num_examples=0,
@@ -610,7 +624,7 @@ class FlowerClient(fl.client.Client):
             )
         elif config.get("federaser_mode") == "correction":
             if self.is_target_client:
-                return FitRes(
+                return make_fit_res(
                     parameters=self.get_parameters({}).parameters,
                     status=Status(code=Code(0), message="Target client skipped correction"),
                     num_examples=0,
@@ -638,7 +652,7 @@ class FlowerClient(fl.client.Client):
 
             losses = self.trainer.logger.my_fantastic_logging["train_losses"]
             loss = float(np.round(losses[-1], decimals=4)) if losses else 0.0
-            return FitRes(
+            return make_fit_res(
                 parameters=self.get_parameters({}).parameters,
                 status=Status(code=Code(0), message="Correction training complete"),
                 num_examples=self.get_num_training_examples(),
@@ -667,24 +681,27 @@ class FlowerClient(fl.client.Client):
             tl = np.round(
                 self.trainer.logger.my_fantastic_logging["train_losses"][-1], decimals=4
             )
-            fr = FitRes(
+            metrics = {
+                "client_id": self.client_id,
+                "dataset_id": self.dataset_id,
+                "dataset_name": self.dataset_name,
+                "loss": float(tl),
+                "is_target_client": self.is_target_client,
+            }
+            add_metric_if_not_none(metrics, "delta_t", self.delta_t)
+            add_metric_if_not_none(metrics, "r", self.r)
+            fr = make_fit_res(
                 parameters=self.get_parameters({}).parameters,
                 status=Status(code=Code(0), message=""),
                 num_examples=self.get_num_training_examples(),
-                metrics={
-                    "client_id": self.client_id,
-                    "dataset_id": self.dataset_id,
-                    "dataset_name": self.dataset_name,
-                    "loss": float(tl),
-                    "is_target_client": self.is_target_client,
-                    "delta_t": self.delta_t,
-                    "r": self.r,
-                },
+                metrics=metrics,
             )
             return fr
 
     def evaluate(self, ei):
         # We need to update to the aggregated parameters, otherwise the model will be evaluated on local weights
+        if not self.extract_fingerprint:
+            self.ensure_training_context(getattr(self.args, "p", "nnUNetPlans"))
         self.set_parameters(ei.parameters)
         config = self.get_config(ei)
 
@@ -776,6 +793,6 @@ def run_client(args, device):
     )
 
     # Clean up after federated training and perform local validation
-    if args.task in ("train", "unlearn"):
+    if args.task in ("train", "unlearn") and client.trainer is not None:
         client.trainer.on_train_end()
         client.trainer.perform_actual_validation()

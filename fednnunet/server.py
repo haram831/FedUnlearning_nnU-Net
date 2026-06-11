@@ -349,22 +349,27 @@ def average_dicts(dicts):
     if not dicts:
         return {}
 
-    # Initialize a dictionary to keep track of the sum and count for each key
     totals = {}
     counts = {}
+    non_numeric_values = {}
 
-    # Iterate through each dictionary
     for d in dicts:
         for key, value in d.items():
-            if key in totals:
-                totals[key] += value
-                counts[key] += 1
-            else:
-                totals[key] = value
-                counts[key] = 1
+            if isinstance(value, bool):
+                non_numeric_values.setdefault(key, []).append(value)
+            elif isinstance(value, (int, float)):
+                totals[key] = totals.get(key, 0.0) + float(value)
+                counts[key] = counts.get(key, 0) + 1
+            elif value is not None:
+                non_numeric_values.setdefault(key, []).append(value)
 
-    # Calculate the average for each key
     averages = {key: totals[key] / counts[key] for key in totals}
+    for key, values in non_numeric_values.items():
+        unique_values = list(dict.fromkeys(values))
+        if len(unique_values) == 1:
+            averages[key] = unique_values[0]
+        else:
+            averages[key] = json.dumps(unique_values)
 
     return averages
 
@@ -567,6 +572,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
         level2_epochs: int = 1,
         level2_transfer_source: str = "latest_global",
         level2_min_transfer_ratio: float = 0.0,
+        clients_per_round: Optional[int] = None,
         *,
         fraction_fit: float = 1.0,
         fraction_evaluate: float = 1.0,
@@ -630,6 +636,9 @@ class MyStrategy(fl.server.strategy.FedAvg):
         self.level2_epochs = max(1, int(level2_epochs))
         self.level2_transfer_source = str(level2_transfer_source)
         self.level2_min_transfer_ratio = max(0.0, float(level2_min_transfer_ratio))
+        self.clients_per_round = (
+            None if clients_per_round is None else max(1, int(clients_per_round))
+        )
         self.saved_plan_diff_artifact = False
         self.latest_global_state_dict = None
         self.saved_initial_federaser_checkpoint = False
@@ -656,6 +665,40 @@ class MyStrategy(fl.server.strategy.FedAvg):
         self.final_corrected_checkpoint_path = None
         self.final_level2_checkpoint_path = None
         self.level2_transfer_source_report = None
+
+    def sample_fit_clients(
+        self,
+        server_round: int,
+        client_manager: ClientManager,
+        allowed_client_ids: Optional[List[str]] = None,
+    ) -> List[ClientProxy]:
+        available_clients = client_manager.all()
+        if allowed_client_ids:
+            allowed = set(str(client_id) for client_id in allowed_client_ids)
+            clients = [
+                client
+                for cid, client in available_clients.items()
+                if str(cid) in allowed
+            ]
+        else:
+            clients = list(available_clients.values())
+
+        if not clients:
+            sample_size, min_num_clients = self.num_fit_clients(
+                client_manager.num_available()
+            )
+            return client_manager.sample(
+                num_clients=sample_size,
+                min_num_clients=min_num_clients,
+            )
+
+        clients = sorted(clients, key=lambda client: str(client.cid))
+        if self.clients_per_round is None or self.clients_per_round >= len(clients):
+            return clients
+
+        start = ((server_round - 1) * self.clients_per_round) % len(clients)
+        doubled = clients + clients
+        return doubled[start : start + self.clients_per_round]
 
     def create_unlearning_plan_diff_artifact(self) -> None:
         if self.saved_plan_diff_artifact:
@@ -934,13 +977,11 @@ class MyStrategy(fl.server.strategy.FedAvg):
     def sample_unlearning_clients(
         self,
         client_manager: ClientManager,
+        server_round: int = 1,
     ) -> List[ClientProxy]:
-        sample_size, min_num_clients = self.num_fit_clients(
-            client_manager.num_available()
-        )
-        clients = client_manager.sample(
-            num_clients=sample_size,
-            min_num_clients=min_num_clients,
+        clients = self.sample_fit_clients(
+            server_round=server_round,
+            client_manager=client_manager,
         )
         if not self.retained_client_ids:
             return clients
@@ -1016,7 +1057,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 fit_ins = FitIns(parameters, config)
                 return [
                     (client, fit_ins)
-                    for client in self.sample_unlearning_clients(client_manager)
+                    for client in self.sample_unlearning_clients(client_manager, server_round)
                 ]
 
             if self.unlearning_phase == "level2_transfer":
@@ -1034,7 +1075,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 fit_ins = FitIns(state_dict_to_parameters(source_state_dict), config)
                 return [
                     (client, fit_ins)
-                    for client in self.sample_unlearning_clients(client_manager)
+                    for client in self.sample_unlearning_clients(client_manager, server_round)
                 ]
 
             if self.unlearning_phase == "level2_retrain":
@@ -1053,7 +1094,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 )
                 return [
                     (client, fit_ins)
-                    for client in self.sample_unlearning_clients(client_manager)
+                    for client in self.sample_unlearning_clients(client_manager, server_round)
                 ]
 
             if self.unlearning_phase == "preprocess":
@@ -1076,7 +1117,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 fit_ins = FitIns(parameters, config)
                 return [
                     (client, fit_ins)
-                    for client in self.sample_unlearning_clients(client_manager)
+                    for client in self.sample_unlearning_clients(client_manager, server_round)
                 ]
 
             if self.unlearning_phase == "correction":
@@ -1093,7 +1134,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 )
                 return [
                     (client, fit_ins)
-                    for client in self.sample_unlearning_clients(client_manager)
+                    for client in self.sample_unlearning_clients(client_manager, server_round)
                 ]
 
             if self.unlearning_phase == "completed":
@@ -1104,7 +1145,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 )
                 return [
                     (client, fit_ins)
-                    for client in self.sample_unlearning_clients(client_manager)
+                    for client in self.sample_unlearning_clients(client_manager, server_round)
                 ]
 
             retained_round_id = self.get_federaser_round_id(server_round)
@@ -1123,7 +1164,10 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 state_dict_to_parameters(self.federaser_current_state_dict),
                 config,
             )
-            return [(client, fit_ins) for client in self.sample_unlearning_clients(client_manager)]
+            return [
+                (client, fit_ins)
+                for client in self.sample_unlearning_clients(client_manager, server_round)
+            ]
 
         if self.task == "extract_fingerprint" or self.task == "plan_and_preprocess":
             if server_round == 1:
@@ -1144,11 +1188,9 @@ class MyStrategy(fl.server.strategy.FedAvg):
         fit_ins = FitIns(parameters, config)
 
         # Sample clients
-        sample_size, min_num_clients = self.num_fit_clients(
-            client_manager.num_available()
-        )
-        clients = client_manager.sample(
-            num_clients=sample_size, min_num_clients=min_num_clients
+        clients = self.sample_fit_clients(
+            server_round=server_round,
+            client_manager=client_manager,
         )
         if self.task == "extract_fingerprint" or self.task == "plan_and_preprocess":
             return [(client, fit_ins) for client in clients]
@@ -1749,6 +1791,12 @@ def main() -> None:
         help="Number of federated training rounds. Defaults to 2 for planning tasks and 1000 for training.",
     )
     parser.add_argument(
+        "--clients_per_round",
+        type=int,
+        default=None,
+        help="Number of clients to train in each federated round. Defaults to all clients.",
+    )
+    parser.add_argument(
         "--target_client",
         type=int,
         default=None,
@@ -1892,6 +1940,11 @@ def main() -> None:
         raise ValueError("--level2_epochs must be a positive integer")
     if args.level2_min_transfer_ratio < 0:
         raise ValueError("--level2_min_transfer_ratio must be non-negative")
+    if args.clients_per_round is not None:
+        if args.clients_per_round <= 0:
+            raise ValueError("--clients_per_round must be a positive integer")
+        if args.clients_per_round > num_clients:
+            raise ValueError("--clients_per_round cannot exceed --num_clients")
 
     if args.task == "extract_fingerprint" or args.task == "plan_and_preprocess":
         num_rounds = 2
@@ -1948,8 +2001,9 @@ def main() -> None:
         level2_epochs=args.level2_epochs,
         level2_transfer_source=args.level2_transfer_source,
         level2_min_transfer_ratio=args.level2_min_transfer_ratio,
+        clients_per_round=args.clients_per_round,
         min_available_clients=num_clients,
-        min_fit_clients=num_clients,
+        min_fit_clients=args.clients_per_round or num_clients,
         min_evaluate_clients=num_clients,
         fraction_evaluate=fraction_evaluate,
     )
