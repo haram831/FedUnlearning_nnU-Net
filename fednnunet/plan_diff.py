@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import shutil
 from typing import Any, Dict, Optional, Tuple
@@ -40,6 +41,13 @@ PREPROCESSING_FIELDS = (
     ("use_mask_for_norm", ("use_mask_for_norm",)),
 )
 
+PREPROCESSING_CRITICAL_FIELDS = (
+    "spacing",
+    "normalization_schemes",
+    "use_mask_for_norm",
+    "preprocessor_name",
+)
+
 PLAN_DISTANCE_WEIGHTS = {
     "spacing": 0.15,
     "patch_size": 0.15,
@@ -75,6 +83,13 @@ def _get_nested(data: Dict[str, Any], path: Tuple[str, ...]) -> Any:
     return current
 
 
+def _set_nested(data: Dict[str, Any], path: Tuple[str, ...], value: Any) -> None:
+    current: Any = data
+    for key in path[:-1]:
+        current = current.setdefault(key, {})
+    current[path[-1]] = copy.deepcopy(value)
+
+
 def _changed_fields(
     original: Dict[str, Any],
     minus: Dict[str, Any],
@@ -90,6 +105,45 @@ def _changed_fields(
                 "minus_target": minus_value,
             }
     return changes
+
+
+def create_architecture_preserving_level1_plan(
+    original_plan: Dict[str, Any],
+    minus_plan: Dict[str, Any],
+) -> Dict[str, Any]:
+    level1_plan = copy.deepcopy(minus_plan)
+    original_configurations = original_plan.get("configurations", {})
+    level1_configurations = level1_plan.get("configurations", {})
+
+    for configuration, original_config in original_configurations.items():
+        if configuration not in level1_configurations:
+            level1_configurations[configuration] = copy.deepcopy(original_config)
+            continue
+        for _, path in ARCHITECTURE_FIELDS:
+            original_value = _get_nested(original_config, path)
+            if original_value is not None:
+                _set_nested(level1_configurations[configuration], path, original_value)
+
+    level1_plan["configurations"] = {
+        configuration: level1_configurations[configuration]
+        for configuration in original_configurations
+        if configuration in level1_configurations
+    }
+    return level1_plan
+
+
+def get_preprocessing_critical_changes(plan_diff: Dict[str, Any]) -> Dict[str, Any]:
+    critical_changes = {}
+    for configuration, diff in plan_diff.get("configurations", {}).items():
+        preprocessing_changes = diff.get("preprocessing_changes", {})
+        matched = {
+            field: change
+            for field, change in preprocessing_changes.items()
+            if field.split(".")[-1] in PREPROCESSING_CRITICAL_FIELDS
+        }
+        if matched:
+            critical_changes[configuration] = matched
+    return critical_changes
 
 
 def _as_float_array(value: Any) -> Optional[np.ndarray]:

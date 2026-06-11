@@ -108,6 +108,12 @@ To run training with 5 nodes on one machine for 3d_fullres configuration and all
 ```bash
 python fednnunet/run.py train "301 302 303 304 305" 3d_fullres all --port 8080
 ```
+
+To train only a subset of clients in each federated round, add `--clients_per_round`.
+For example, this trains two clients per round and rotates through all available clients:
+```bash
+python fednnunet/run.py train "301 302 303 304 305" 3d_fullres all --port 8080 --clients_per_round 2
+```
 ### 🔀 Training Modes
 Following the FednnU-Net paper, it is possible to train the model in two ways: Federated Fingerprint Extraction (FFE) and Asymetric Federated Averaging (AsymFedAvg). While both methods works well in different scenarios, it is best to use the FFE method as the starting point as it's more robust and gives results very close to models trained in a centralized way.
 
@@ -188,4 +194,3 @@ This work received funding from the European Union’s Horizon Europe research a
 
 
 <img src="assets/dt4h_logo.png" width="120">  <img src="assets/radioval_logo.jpeg" width="250"> <img src="assets/aimix_logo.png" width="160">    <img src="assets/eucanimage_logo.jpeg" width="160">
-

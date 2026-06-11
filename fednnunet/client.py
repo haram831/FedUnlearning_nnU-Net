@@ -124,6 +124,46 @@ def add_unlearning_arguments(parser_unlearn: argparse.ArgumentParser) -> None:
         default=0.5,
         help="[OPTIONAL] FedEraser calibration ratio. Default: 0.5.",
     )
+    parser_unlearn.add_argument(
+        "--calibration_epochs",
+        type=int,
+        default=None,
+        help="[OPTIONAL] Override FedEraser local calibration epochs. Defaults to max(1, round(r)).",
+    )
+    parser_unlearn.add_argument(
+        "--correction_epochs",
+        type=int,
+        default=1,
+        help="[OPTIONAL] Local epochs per FedEraser correction round. Default: 1.",
+    )
+    parser_unlearn.add_argument(
+        "--level2_epochs",
+        type=int,
+        default=1,
+        help="[OPTIONAL] Local epochs per Level 2 retained retraining round. Default: 1.",
+    )
+    parser_unlearn.add_argument(
+        "-c",
+        dest="preprocess_configurations",
+        required=False,
+        default=["2d", "3d_fullres", "3d_lowres"],
+        nargs="+",
+        help="[OPTIONAL] Configurations to preprocess during retained-client unlearning preprocessing.",
+    )
+    parser_unlearn.add_argument(
+        "-np",
+        type=int,
+        nargs="+",
+        default=None,
+        required=False,
+        help="[OPTIONAL] Number of preprocessing processes for retained-client unlearning preprocessing.",
+    )
+    parser_unlearn.add_argument(
+        "--verbose",
+        required=False,
+        action="store_true",
+        help="[OPTIONAL] Print verbose preprocessing logs.",
+    )
 
 
 def add_fingerprint_arguments(parser_fingerprint: argparse.ArgumentParser) -> None:
@@ -313,7 +353,7 @@ def client_entry():
     import torch
 
     device = torch.device("cpu")
-    if args.task == "train":
+    if args.task in ("train", "unlearn"):
         assert args.device in [
             "cpu",
             "cuda",

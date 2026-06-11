@@ -54,7 +54,7 @@ def state_dict_to_parameters(state_dict) -> Parameters:
 def bytes_to_state_dict(bytes_data: bytes) -> dict:
     """Converts bytes back to a PyTorch state_dict."""
     bytes_io = BytesIO(bytes_data)
-    return torch.load(bytes_io)
+    return torch.load(bytes_io, weights_only=False)
 
 
 def parameters_to_state_dict(parameters: Parameters) -> dict:
@@ -75,6 +75,34 @@ def parse_bool(value: Any) -> bool:
     return bool(value)
 
 
+def add_metric_if_not_none(metrics: Dict[str, Any], key: str, value: Any) -> None:
+    if value is not None:
+        metrics[key] = value
+
+
+def sanitize_flower_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized: Dict[str, Any] = {}
+    for key, value in metrics.items():
+        if value is None:
+            continue
+        if isinstance(value, np.generic):
+            value = value.item()
+        elif isinstance(value, (list, tuple)):
+            value = [
+                item.item() if isinstance(item, np.generic) else item
+                for item in value
+                if item is not None
+            ]
+        sanitized[key] = value
+    return sanitized
+
+
+def make_fit_res(**kwargs: Any) -> FitRes:
+    if "metrics" in kwargs:
+        kwargs["metrics"] = sanitize_flower_metrics(kwargs["metrics"])
+    return FitRes(**kwargs)
+
+
 class FlowerClient(fl.client.Client):
 
     def __init__(
@@ -85,6 +113,7 @@ class FlowerClient(fl.client.Client):
     ):
         self.task = task
         self.args = args
+        self.device = device
         self.dataset_name = maybe_convert_to_dataset_name(args.dataset_name_or_id)
         self.dataset_id = convert_dataset_name_to_id(self.dataset_name)
         self.client_id = getattr(args, "client_id", None) or str(self.dataset_id)
@@ -94,33 +123,17 @@ class FlowerClient(fl.client.Client):
         self.preprocess_dataset = False
 
         self.train = False
+        self.trainer = None
+        self.model = None
+        self.current_plans_identifier = None
         if self.task in ("train", "unlearn"):
             self.train = True
-            self.is_target_client = getattr(args, "is_target_client", False)
+            self.is_target_client = bool(getattr(args, "is_target_client", False))
             self.delta_t = getattr(args, "delta_t", None)
             self.r = getattr(args, "r", None)
-            # this calls run_training but is not running any training, I did not change the name of the method for compatibility with regular nnUnet.
-            self.trainer = run_training(
-                args.dataset_name_or_id,
-                args.configuration,
-                args.fold,
-                args.tr,
-                args.p,
-                args.pretrained_weights,
-                args.num_gpus,
-                args.use_compressed,
-                args.npz,
-                args.c,
-                args.val,
-                args.disable_checkpointing,
-                args.val_best,
-                device=device,
-                return_trainer=True,
-            )
-
-            self.trainer.initialize()
-            self.model = self.trainer.network
-            self.trainer.on_train_start()
+            self.calibration_epochs = getattr(args, "calibration_epochs", 1)
+            self.correction_epochs = getattr(args, "correction_epochs", 1)
+            self.level2_epochs = getattr(args, "level2_epochs", 1)
 
         if self.task == "plan_and_preprocess":
             self.extract_fingerprint = True
@@ -146,6 +159,68 @@ class FlowerClient(fl.client.Client):
 
         self.preprocessed_output_folder = join(nnUNet_preprocessed, self.dataset_name)
 
+    def ensure_training_context(self, plans_identifier: str) -> None:
+        plans_identifier = plans_identifier or getattr(self.args, "p", "nnUNetPlans")
+        if getattr(self, "current_plans_identifier", None) == plans_identifier:
+            return
+
+        is_default_plan = plans_identifier == getattr(self.args, "p", "nnUNetPlans")
+        self.trainer = run_training(
+            self.args.dataset_name_or_id,
+            self.args.configuration,
+            self.args.fold,
+            self.args.tr,
+            plans_identifier,
+            self.args.pretrained_weights if is_default_plan else None,
+            self.args.num_gpus,
+            self.args.use_compressed,
+            self.args.npz,
+            self.args.c if is_default_plan else False,
+            self.args.val,
+            self.args.disable_checkpointing,
+            self.args.val_best,
+            device=self.device,
+            return_trainer=True,
+        )
+        self.trainer.initialize()
+        self.model = self.trainer.network
+        self.trainer.on_train_start()
+        self.current_plans_identifier = plans_identifier
+
+    def partial_transfer_state_dict(self, source_state_dict: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+        target_state_dict = self.model.state_dict()
+        transferred_keys = []
+        skipped_keys = []
+        transferred_params = 0
+        total_params = 0
+
+        for key, target_value in target_state_dict.items():
+            if torch.is_tensor(target_value):
+                total_params += int(target_value.numel())
+            source_value = source_state_dict.get(key)
+            if (
+                torch.is_tensor(target_value)
+                and torch.is_tensor(source_value)
+                and target_value.shape == source_value.shape
+            ):
+                target_state_dict[key] = source_value.detach().cpu().to(dtype=target_value.dtype)
+                transferred_keys.append(key)
+                transferred_params += int(target_value.numel())
+            else:
+                skipped_keys.append(key)
+
+        self.model.load_state_dict(target_state_dict, strict=True)
+        transfer_ratio = transferred_params / total_params if total_params > 0 else 0.0
+        return {
+            "transferred_keys": transferred_keys,
+            "skipped_keys": skipped_keys,
+            "transferred_key_count": len(transferred_keys),
+            "skipped_key_count": len(skipped_keys),
+            "transferred_param_count": transferred_params,
+            "total_param_count": total_params,
+            "transfer_ratio": transfer_ratio,
+        }
+
     def get_overlapping_keys(self, state_dict1, state_dict2):
         """Find keys that are present in both state_dicts and have the same shape."""
         overlapping_keys = set(state_dict1.keys()).intersection(state_dict2.keys())
@@ -168,6 +243,7 @@ class FlowerClient(fl.client.Client):
         return target_state_dict
 
     def get_num_training_examples(self):
+        self.ensure_training_context(getattr(self.args, "p", "nnUNetPlans"))
         dataloader = self.trainer.dataloader_train
         if hasattr(dataloader, "indices"):
             return len(dataloader.indices)
@@ -256,6 +332,7 @@ class FlowerClient(fl.client.Client):
             parameters = self.get_fingerprint(self.get_config(fi))
             # print(f'Fingerprint with mean: {self.fingerprint["median_relative_size_after_cropping"]}')
         else:
+            self.ensure_training_context(getattr(self.args, "p", "nnUNetPlans"))
             parameters = self.model.state_dict()
 
         parm = GetParametersRes(
@@ -271,6 +348,7 @@ class FlowerClient(fl.client.Client):
         if self.extract_fingerprint:
             self.fingerprint = common_state_dict
         else:
+            self.ensure_training_context(getattr(self.args, "p", "nnUNetPlans"))
             # torch.save(common_state_dict,os.path.join(os.path.dirname(os.path.abspath(__file__)),'common_state_dict.arch'))
             # torch.save(self.model.state_dict(),os.path.join(os.path.dirname(os.path.abspath(__file__)),'local_state_dict.arch'))
 
@@ -280,10 +358,16 @@ class FlowerClient(fl.client.Client):
             self.model.load_state_dict(onset_subset_keys_dict, strict=True)
 
     def fit(self, fi):
-        self.set_parameters(fi.parameters)
+        config = self.get_config(fi)
+        federaser_mode = config.get("federaser_mode")
+        if federaser_mode == "level2_retrain":
+            self.ensure_training_context(config.get("plans_identifier", self.args.p))
+            self.set_parameters(fi.parameters)
+        elif federaser_mode not in ("level2_preprocess", "level2_transfer"):
+            self.set_parameters(fi.parameters)
 
         if self.extract_fingerprint:
-            return FitRes(
+            return make_fit_res(
                 parameters=self.get_parameters(fi).parameters,
                 status=Status(code=Code(0), message="Fingerprint extracted"),
                 num_examples=0,
@@ -291,6 +375,295 @@ class FlowerClient(fl.client.Client):
                     "client_id": self.client_id,
                     "dataset_id": self.dataset_id,
                     "dataset_name": self.dataset_name,
+                },
+            )
+        elif config.get("federaser_mode") == "calibration":
+            if self.is_target_client:
+                return make_fit_res(
+                    parameters=self.get_parameters({}).parameters,
+                    status=Status(code=Code(0), message="Target client skipped FedEraser calibration"),
+                    num_examples=0,
+                    metrics={
+                        "client_id": self.client_id,
+                        "dataset_id": self.dataset_id,
+                        "dataset_name": self.dataset_name,
+                        "is_target_client": True,
+                        "federaser_mode": "calibration",
+                        "skipped": True,
+                    },
+                )
+
+            calibration_epochs = max(1, int(config.get("calibration_epochs", 1)))
+            try:
+                for _ in range(calibration_epochs):
+                    self.trainer.run_federated_train_round()
+            except ValueError as e:
+                logging.error(f"ValueError occurred during FedEraser calibration: {e}")
+            except RuntimeError as e:
+                logging.error(f"RuntimeError occurred during FedEraser calibration: {e}")
+            except Exception as e:
+                logging.error(f"Unexpected error during FedEraser calibration: {e}")
+                raise
+
+            losses = self.trainer.logger.my_fantastic_logging["train_losses"]
+            loss = float(np.round(losses[-1], decimals=4)) if losses else 0.0
+            metrics = {
+                "client_id": self.client_id,
+                "dataset_id": self.dataset_id,
+                "dataset_name": self.dataset_name,
+                "loss": loss,
+                "is_target_client": False,
+                "federaser_mode": "calibration",
+                "calibration_epochs": calibration_epochs,
+            }
+            add_metric_if_not_none(metrics, "delta_t", self.delta_t)
+            add_metric_if_not_none(metrics, "r", self.r)
+            return make_fit_res(
+                parameters=self.get_parameters({}).parameters,
+                status=Status(code=Code(0), message="FedEraser calibration complete"),
+                num_examples=self.get_num_training_examples(),
+                metrics=metrics,
+            )
+        elif config.get("federaser_mode") == "level2_preprocess":
+            if self.is_target_client:
+                return make_fit_res(
+                    parameters=self.get_parameters({}).parameters,
+                    status=Status(code=Code(0), message="Target client skipped Level 2 preprocessing"),
+                    num_examples=0,
+                    metrics={
+                        "client_id": self.client_id,
+                        "dataset_id": self.dataset_id,
+                        "dataset_name": self.dataset_name,
+                        "is_target_client": True,
+                        "federaser_mode": "level2_preprocess",
+                        "skipped": True,
+                    },
+                )
+
+            plans_identifier = config.get("plans_identifier") or getattr(self.args, "p", "nnUNetPlans")
+            configurations = getattr(
+                self.args,
+                "preprocess_configurations",
+                ["2d", "3d_fullres", "3d_lowres"],
+            )
+            num_processes = getattr(self.args, "np", None)
+            if num_processes is None:
+                default_np = {"2d": 8, "3d_fullres": 4, "3d_lowres": 8}
+                num_processes = [
+                    default_np[c] if c in default_np else 4
+                    for c in configurations
+                ]
+            preprocess(
+                [self.dataset_id],
+                plans_identifier=plans_identifier,
+                configurations=configurations,
+                num_processes=num_processes,
+                verbose=getattr(self.args, "verbose", False),
+            )
+            return make_fit_res(
+                parameters=self.get_parameters({}).parameters,
+                status=Status(code=Code(0), message="Level 2 retained preprocessing complete"),
+                num_examples=0,
+                metrics={
+                    "client_id": self.client_id,
+                    "dataset_id": self.dataset_id,
+                    "dataset_name": self.dataset_name,
+                    "is_target_client": False,
+                    "federaser_mode": "level2_preprocess",
+                    "plans_identifier": plans_identifier,
+                    "configurations": json.dumps(configurations),
+                },
+            )
+        elif config.get("federaser_mode") == "level2_transfer":
+            if self.is_target_client:
+                return make_fit_res(
+                    parameters=self.get_parameters({}).parameters,
+                    status=Status(code=Code(0), message="Target client skipped Level 2 transfer"),
+                    num_examples=0,
+                    metrics={
+                        "client_id": self.client_id,
+                        "dataset_id": self.dataset_id,
+                        "dataset_name": self.dataset_name,
+                        "is_target_client": True,
+                        "federaser_mode": "level2_transfer",
+                        "skipped": True,
+                    },
+                )
+
+            plans_identifier = config.get("plans_identifier") or getattr(self.args, "p", "nnUNetPlans")
+            self.ensure_training_context(plans_identifier)
+            transfer_report = self.partial_transfer_state_dict(
+                parameters_to_state_dict(fi.parameters)
+            )
+            return make_fit_res(
+                parameters=self.get_parameters({}).parameters,
+                status=Status(code=Code(0), message="Level 2 compatible transfer complete"),
+                num_examples=self.get_num_training_examples(),
+                metrics={
+                    "client_id": self.client_id,
+                    "dataset_id": self.dataset_id,
+                    "dataset_name": self.dataset_name,
+                    "is_target_client": False,
+                    "federaser_mode": "level2_transfer",
+                    "plans_identifier": plans_identifier,
+                    "transferred_key_count": transfer_report["transferred_key_count"],
+                    "skipped_key_count": transfer_report["skipped_key_count"],
+                    "transferred_param_count": transfer_report["transferred_param_count"],
+                    "total_param_count": transfer_report["total_param_count"],
+                    "transfer_ratio": transfer_report["transfer_ratio"],
+                    "transfer_report_json": json.dumps(transfer_report),
+                },
+            )
+        elif config.get("federaser_mode") == "level2_retrain":
+            if self.is_target_client:
+                return make_fit_res(
+                    parameters=self.get_parameters({}).parameters,
+                    status=Status(code=Code(0), message="Target client skipped Level 2 retraining"),
+                    num_examples=0,
+                    metrics={
+                        "client_id": self.client_id,
+                        "dataset_id": self.dataset_id,
+                        "dataset_name": self.dataset_name,
+                        "is_target_client": True,
+                        "federaser_mode": "level2_retrain",
+                        "skipped": True,
+                    },
+                )
+
+            level2_epochs = max(1, int(config.get("level2_epochs", self.level2_epochs)))
+            try:
+                for _ in range(level2_epochs):
+                    self.trainer.run_federated_train_round()
+            except ValueError as e:
+                logging.error(f"ValueError occurred during Level 2 retraining: {e}")
+            except RuntimeError as e:
+                logging.error(f"RuntimeError occurred during Level 2 retraining: {e}")
+            except Exception as e:
+                logging.error(f"Unexpected error during Level 2 retraining: {e}")
+                raise
+
+            losses = self.trainer.logger.my_fantastic_logging["train_losses"]
+            loss = float(np.round(losses[-1], decimals=4)) if losses else 0.0
+            return make_fit_res(
+                parameters=self.get_parameters({}).parameters,
+                status=Status(code=Code(0), message="Level 2 retraining complete"),
+                num_examples=self.get_num_training_examples(),
+                metrics={
+                    "client_id": self.client_id,
+                    "dataset_id": self.dataset_id,
+                    "dataset_name": self.dataset_name,
+                    "loss": loss,
+                    "is_target_client": False,
+                    "federaser_mode": "level2_retrain",
+                    "level2_epochs": level2_epochs,
+                },
+            )
+        elif config.get("federaser_mode") == "preprocess_retained":
+            if self.is_target_client:
+                return make_fit_res(
+                    parameters=self.get_parameters({}).parameters,
+                    status=Status(code=Code(0), message="Target client skipped retained preprocessing"),
+                    num_examples=0,
+                    metrics={
+                        "client_id": self.client_id,
+                        "dataset_id": self.dataset_id,
+                        "dataset_name": self.dataset_name,
+                        "is_target_client": True,
+                        "federaser_mode": "preprocess_retained",
+                        "skipped": True,
+                    },
+                )
+
+            plans_identifier = config.get("plans_identifier") or getattr(self.args, "p", "nnUNetPlans")
+            configurations = getattr(
+                self.args,
+                "preprocess_configurations",
+                ["2d", "3d_fullres", "3d_lowres"],
+            )
+            num_processes = getattr(self.args, "np", None)
+            if num_processes is None:
+                default_np = {"2d": 8, "3d_fullres": 4, "3d_lowres": 8}
+                num_processes = [
+                    default_np[c] if c in default_np else 4
+                    for c in configurations
+                ]
+            preprocess(
+                [self.dataset_id],
+                plans_identifier=plans_identifier,
+                configurations=configurations,
+                num_processes=num_processes,
+                verbose=getattr(self.args, "verbose", False),
+            )
+            return make_fit_res(
+                parameters=self.get_parameters({}).parameters,
+                status=Status(code=Code(0), message="Retained preprocessing complete"),
+                num_examples=0,
+                metrics={
+                    "client_id": self.client_id,
+                    "dataset_id": self.dataset_id,
+                    "dataset_name": self.dataset_name,
+                    "is_target_client": False,
+                    "federaser_mode": "preprocess_retained",
+                    "plans_identifier": plans_identifier,
+                    "configurations": json.dumps(configurations),
+                },
+            )
+        elif config.get("federaser_mode") == "preprocess_skip":
+            return make_fit_res(
+                parameters=self.get_parameters({}).parameters,
+                status=Status(code=Code(0), message="Retained preprocessing skipped"),
+                num_examples=0,
+                metrics={
+                    "client_id": self.client_id,
+                    "dataset_id": self.dataset_id,
+                    "dataset_name": self.dataset_name,
+                    "is_target_client": self.is_target_client,
+                    "federaser_mode": "preprocess_skip",
+                    "skipped": True,
+                },
+            )
+        elif config.get("federaser_mode") == "correction":
+            if self.is_target_client:
+                return make_fit_res(
+                    parameters=self.get_parameters({}).parameters,
+                    status=Status(code=Code(0), message="Target client skipped correction"),
+                    num_examples=0,
+                    metrics={
+                        "client_id": self.client_id,
+                        "dataset_id": self.dataset_id,
+                        "dataset_name": self.dataset_name,
+                        "is_target_client": True,
+                        "federaser_mode": "correction",
+                        "skipped": True,
+                    },
+                )
+
+            correction_epochs = max(1, int(config.get("correction_epochs", self.correction_epochs)))
+            try:
+                for _ in range(correction_epochs):
+                    self.trainer.run_federated_train_round()
+            except ValueError as e:
+                logging.error(f"ValueError occurred during correction training: {e}")
+            except RuntimeError as e:
+                logging.error(f"RuntimeError occurred during correction training: {e}")
+            except Exception as e:
+                logging.error(f"Unexpected error during correction training: {e}")
+                raise
+
+            losses = self.trainer.logger.my_fantastic_logging["train_losses"]
+            loss = float(np.round(losses[-1], decimals=4)) if losses else 0.0
+            return make_fit_res(
+                parameters=self.get_parameters({}).parameters,
+                status=Status(code=Code(0), message="Correction training complete"),
+                num_examples=self.get_num_training_examples(),
+                metrics={
+                    "client_id": self.client_id,
+                    "dataset_id": self.dataset_id,
+                    "dataset_name": self.dataset_name,
+                    "loss": loss,
+                    "is_target_client": False,
+                    "federaser_mode": "correction",
+                    "correction_epochs": correction_epochs,
                 },
             )
         else:
@@ -308,24 +681,27 @@ class FlowerClient(fl.client.Client):
             tl = np.round(
                 self.trainer.logger.my_fantastic_logging["train_losses"][-1], decimals=4
             )
-            fr = FitRes(
+            metrics = {
+                "client_id": self.client_id,
+                "dataset_id": self.dataset_id,
+                "dataset_name": self.dataset_name,
+                "loss": float(tl),
+                "is_target_client": self.is_target_client,
+            }
+            add_metric_if_not_none(metrics, "delta_t", self.delta_t)
+            add_metric_if_not_none(metrics, "r", self.r)
+            fr = make_fit_res(
                 parameters=self.get_parameters({}).parameters,
                 status=Status(code=Code(0), message=""),
                 num_examples=self.get_num_training_examples(),
-                metrics={
-                    "client_id": self.client_id,
-                    "dataset_id": self.dataset_id,
-                    "dataset_name": self.dataset_name,
-                    "loss": float(tl),
-                    "is_target_client": self.is_target_client,
-                    "delta_t": self.delta_t,
-                    "r": self.r,
-                },
+                metrics=metrics,
             )
             return fr
 
     def evaluate(self, ei):
         # We need to update to the aggregated parameters, otherwise the model will be evaluated on local weights
+        if not self.extract_fingerprint:
+            self.ensure_training_context(getattr(self.args, "p", "nnUNetPlans"))
         self.set_parameters(ei.parameters)
         config = self.get_config(ei)
 
@@ -417,6 +793,6 @@ def run_client(args, device):
     )
 
     # Clean up after federated training and perform local validation
-    if args.task in ("train", "unlearn"):
+    if args.task in ("train", "unlearn") and client.trainer is not None:
         client.trainer.on_train_end()
         client.trainer.perform_actual_validation()
