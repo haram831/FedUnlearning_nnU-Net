@@ -4,6 +4,14 @@ import json
 import os
 import subprocess
 
+from fednnunet.decoder_options import (
+    add_decoder_arguments,
+    decoder_metadata,
+    decoder_options_to_cli_args,
+    effective_training_plans_identifier,
+    effective_training_trainer,
+)
+
 # Convenience script to run federated training on a multi-gpu cluster
 # Each node (data-center) is spawned on a determined GPU and communicates with server on the provided network port
 
@@ -155,6 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.25,
         help="Plan distance high threshold for planning-aware unlearning policy.",
     )
+    add_decoder_arguments(parser, include_unlearn_switch=True)
 
     return parser
 
@@ -238,6 +247,13 @@ def save_experiment_config_snapshot(
     server_command,
     client_commands,
 ):
+    base_trainer = get_option_value(unknown, ("-tr",), "nnUNetTrainer")
+    base_plans_identifier = get_option_value(unknown, ("-p",), "nnUNetPlans")
+    effective_trainer = effective_training_trainer(base_trainer, args)
+    effective_plans_identifier = effective_training_plans_identifier(
+        base_plans_identifier,
+        args,
+    )
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     snapshot_dir = os.path.join(
         get_experiment_snapshot_dir(),
@@ -251,8 +267,11 @@ def save_experiment_config_snapshot(
         "dataset_ids": datasets,
         "fold": fold,
         "configuration": args.configuration,
-        "trainer": get_option_value(unknown, ("-tr",), "nnUNetTrainer"),
-        "plans_identifier": get_option_value(unknown, ("-p",), "nnUNetPlans"),
+        "trainer": effective_trainer,
+        "base_trainer": base_trainer,
+        "plans_identifier": effective_plans_identifier,
+        "base_plans_identifier": base_plans_identifier,
+        "decoder": decoder_metadata(args),
         "unlearning_args": {
             "clients_per_round": getattr(args, "clients_per_round", None),
             "unlearning_level": getattr(args, "unlearning_level", "auto"),
@@ -322,6 +341,13 @@ def main():
     folds = get_folds(task, fold)
 
     configuration = args.configuration
+    base_trainer = get_option_value(unknown, ("-tr",), "nnUNetTrainer")
+    base_plans_identifier = get_option_value(unknown, ("-p",), "nnUNetPlans")
+    effective_trainer = effective_training_trainer(base_trainer, args)
+    effective_plans_identifier = effective_training_plans_identifier(
+        base_plans_identifier,
+        args,
+    )
     port = args.port
     server_optional_args = ""
     if args.num_rounds is not None:
@@ -359,10 +385,11 @@ def main():
             )
         server_optional_args += (
             f" --planning_dataset_id {planning_dataset_id}"
-            f" --plans_identifier {get_option_value(unknown, ('-p',), 'nnUNetPlans')}"
+            f" --plans_identifier {effective_plans_identifier}"
             f" --plan_diff_planner {get_option_value(unknown, ('-pl',), 'ExperimentPlanner')}"
             f" --plan_diff_preprocessor_name "
             f"{get_option_value(unknown, ('-preprocessor_name',), 'DefaultPreprocessor')}"
+            f" {decoder_options_to_cli_args(args, include_unlearn_switch=True)}"
         )
         if plan_diff_gpu_memory_target is not None:
             server_optional_args += (
@@ -396,6 +423,10 @@ def main():
                 # pass the undefined arguments to the client
                 if unknown:
                     optional_args += " ".join(unknown) + " "
+                optional_args += decoder_options_to_cli_args(
+                    args,
+                    include_unlearn_switch=(task == "unlearn"),
+                ) + " "
                 if gpu_memory_target:
                     optional_args += (
                         f"-gpu_memory_target {gpu_memory_target_mapping[client_dataset]} "
@@ -412,7 +443,6 @@ def main():
                         f"--correction_epochs {args.correction_epochs} "
                         f"--level2_epochs {args.level2_epochs} "
                     )
-
                 if task == "plan_and_preprocess":
                     command = f"{process_prefix} python fednnunet/client.py {client_global_args} {task} -d {client_dataset} {optional_args}"
                 elif task in ("train", "unlearn"):

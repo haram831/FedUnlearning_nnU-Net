@@ -31,6 +31,13 @@ from nnunetv2.utilities.dataset_name_id_conversion import (
 )
 from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
 
+from fednnunet.decoder_options import (
+    EFFIDEC3D_UXNET_TRAINER,
+    decoder_metadata,
+    ensure_effidec3d_plans_for_dataset,
+    is_effidec3d_plans_identifier,
+    should_use_effidec3d_for_training,
+)
 from fednnunet.run_training import run_training
 
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -126,6 +133,7 @@ class FlowerClient(fl.client.Client):
         self.trainer = None
         self.model = None
         self.current_plans_identifier = None
+        self.current_trainer_class_name = None
         if self.task in ("train", "unlearn"):
             self.train = True
             self.is_target_client = bool(getattr(args, "is_target_client", False))
@@ -159,17 +167,34 @@ class FlowerClient(fl.client.Client):
 
         self.preprocessed_output_folder = join(nnUNet_preprocessed, self.dataset_name)
 
+    def resolve_trainer_class_name(self, plans_identifier: str) -> str:
+        if is_effidec3d_plans_identifier(plans_identifier):
+            return EFFIDEC3D_UXNET_TRAINER
+        return getattr(self.args, "tr", "nnUNetTrainer")
+
     def ensure_training_context(self, plans_identifier: str) -> None:
         plans_identifier = plans_identifier or getattr(self.args, "p", "nnUNetPlans")
-        if getattr(self, "current_plans_identifier", None) == plans_identifier:
+        trainer_class_name = self.resolve_trainer_class_name(plans_identifier)
+        if (
+            getattr(self, "current_plans_identifier", None) == plans_identifier
+            and getattr(self, "current_trainer_class_name", None) == trainer_class_name
+        ):
             return
+
+        if should_use_effidec3d_for_training(self.args) and is_effidec3d_plans_identifier(plans_identifier):
+            ensure_effidec3d_plans_for_dataset(
+                self.args.dataset_name_or_id,
+                getattr(self.args, "base_plans_identifier", "nnUNetPlans"),
+                self.args,
+                output_plans_identifier=plans_identifier,
+            )
 
         is_default_plan = plans_identifier == getattr(self.args, "p", "nnUNetPlans")
         self.trainer = run_training(
             self.args.dataset_name_or_id,
             self.args.configuration,
             self.args.fold,
-            self.args.tr,
+            trainer_class_name,
             plans_identifier,
             self.args.pretrained_weights if is_default_plan else None,
             self.args.num_gpus,
@@ -186,6 +211,7 @@ class FlowerClient(fl.client.Client):
         self.model = self.trainer.network
         self.trainer.on_train_start()
         self.current_plans_identifier = plans_identifier
+        self.current_trainer_class_name = trainer_class_name
 
     def partial_transfer_state_dict(self, source_state_dict: Dict[str, torch.Tensor]) -> Dict[str, Any]:
         target_state_dict = self.model.state_dict()
@@ -243,7 +269,10 @@ class FlowerClient(fl.client.Client):
         return target_state_dict
 
     def get_num_training_examples(self):
-        self.ensure_training_context(getattr(self.args, "p", "nnUNetPlans"))
+        self.ensure_training_context(
+            getattr(self, "current_plans_identifier", None)
+            or getattr(self.args, "p", "nnUNetPlans")
+        )
         dataloader = self.trainer.dataloader_train
         if hasattr(dataloader, "indices"):
             return len(dataloader.indices)
@@ -332,7 +361,12 @@ class FlowerClient(fl.client.Client):
             parameters = self.get_fingerprint(self.get_config(fi))
             # print(f'Fingerprint with mean: {self.fingerprint["median_relative_size_after_cropping"]}')
         else:
-            self.ensure_training_context(getattr(self.args, "p", "nnUNetPlans"))
+            config = self.get_config(fi)
+            self.ensure_training_context(
+                config.get("plans_identifier")
+                or getattr(self, "current_plans_identifier", None)
+                or getattr(self.args, "p", "nnUNetPlans")
+            )
             parameters = self.model.state_dict()
 
         parm = GetParametersRes(
@@ -341,14 +375,18 @@ class FlowerClient(fl.client.Client):
         )
         return parm
 
-    def set_parameters(self, parameters):
+    def set_parameters(self, parameters, plans_identifier: Optional[str] = None):
 
         common_state_dict = parameters_to_state_dict(parameters)
 
         if self.extract_fingerprint:
             self.fingerprint = common_state_dict
         else:
-            self.ensure_training_context(getattr(self.args, "p", "nnUNetPlans"))
+            self.ensure_training_context(
+                plans_identifier
+                or getattr(self, "current_plans_identifier", None)
+                or getattr(self.args, "p", "nnUNetPlans")
+            )
             # torch.save(common_state_dict,os.path.join(os.path.dirname(os.path.abspath(__file__)),'common_state_dict.arch'))
             # torch.save(self.model.state_dict(),os.path.join(os.path.dirname(os.path.abspath(__file__)),'local_state_dict.arch'))
 
@@ -362,7 +400,7 @@ class FlowerClient(fl.client.Client):
         federaser_mode = config.get("federaser_mode")
         if federaser_mode == "level2_retrain":
             self.ensure_training_context(config.get("plans_identifier", self.args.p))
-            self.set_parameters(fi.parameters)
+            self.set_parameters(fi.parameters, config.get("plans_identifier", self.args.p))
         elif federaser_mode not in ("level2_preprocess", "level2_transfer"):
             self.set_parameters(fi.parameters)
 
@@ -700,10 +738,13 @@ class FlowerClient(fl.client.Client):
 
     def evaluate(self, ei):
         # We need to update to the aggregated parameters, otherwise the model will be evaluated on local weights
-        if not self.extract_fingerprint:
-            self.ensure_training_context(getattr(self.args, "p", "nnUNetPlans"))
-        self.set_parameters(ei.parameters)
         config = self.get_config(ei)
+        if not self.extract_fingerprint:
+            self.ensure_training_context(
+                config.get("plans_identifier")
+                or getattr(self.args, "p", "nnUNetPlans")
+            )
+        self.set_parameters(ei.parameters, config.get("plans_identifier"))
 
         if self.extract_fingerprint:
             if config.get("fingerprint_pass") == "stats":
@@ -734,6 +775,16 @@ class FlowerClient(fl.client.Client):
                     overwrite_target_spacing=self.args.overwrite_target_spacing,
                     overwrite_plans_name=self.args.overwrite_plans_name,
                 )
+                if should_use_effidec3d_for_training(self.args):
+                    plans_identifier = ensure_effidec3d_plans_for_dataset(
+                        self.dataset_id,
+                        plans_identifier,
+                        self.args,
+                    )
+                    logging.info(
+                        f"EffiDec3D plan created for {self.dataset_name}: "
+                        f"{plans_identifier}"
+                    )
                 logging.info(f"Experiment plan created for {self.dataset_name}")
                 if self.preprocess_dataset:
                     preprocess(
@@ -745,15 +796,19 @@ class FlowerClient(fl.client.Client):
                     )
                     logging.info(f"Dataset {self.dataset_name} preprocessed")
 
+            metrics = {
+                "client_id": self.client_id,
+                "dataset_id": self.dataset_id,
+                "dataset_name": self.dataset_name,
+                "decoder_metadata": json.dumps(decoder_metadata(self.args)),
+            }
+            if self.plan_experiment:
+                metrics["plans_identifier"] = plans_identifier
             return EvaluateRes(
                 status=Status(code=Code(0), message="Federated fingerprint saved"),
                 loss=0.0,
                 num_examples=1,
-                metrics={
-                    "client_id": self.client_id,
-                    "dataset_id": self.dataset_id,
-                    "dataset_name": self.dataset_name,
-                },
+                metrics=metrics,
             )
 
         vl = np.round(

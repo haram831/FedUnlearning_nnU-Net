@@ -1,5 +1,6 @@
 import json
 import os
+from argparse import Namespace
 from io import BytesIO
 from logging import INFO, WARNING
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -30,6 +31,15 @@ from fednnunet.federaser import (
     save_unlearning_report,
     start_timer,
     subtract_state_dicts as federaser_subtract_state_dicts,
+)
+from fednnunet.decoder_options import (
+    DECODER_ARCH_EFFIDEC3D_UXNET,
+    DECODER_ARCH_NNUNET,
+    UNLEARN_DECODER_SWITCH_SAME,
+    add_decoder_arguments,
+    apply_effidec3d_to_plans,
+    build_effidec3d_plans_identifier,
+    decoder_metadata,
 )
 from fednnunet.plan_diff import (
     create_architecture_preserving_level1_plan,
@@ -572,6 +582,12 @@ class MyStrategy(fl.server.strategy.FedAvg):
         level2_epochs: int = 1,
         level2_transfer_source: str = "latest_global",
         level2_min_transfer_ratio: float = 0.0,
+        decoder_arch: str = DECODER_ARCH_NNUNET,
+        unlearn_decoder_switch: str = UNLEARN_DECODER_SWITCH_SAME,
+        effidec_channels: Optional[List[int]] = None,
+        effidec_n_decoder_channels: int = 48,
+        effidec_resolution_factor: int = 2,
+        effidec_skip_aggregation: str = "addition",
         clients_per_round: Optional[int] = None,
         *,
         fraction_fit: float = 1.0,
@@ -636,6 +652,12 @@ class MyStrategy(fl.server.strategy.FedAvg):
         self.level2_epochs = max(1, int(level2_epochs))
         self.level2_transfer_source = str(level2_transfer_source)
         self.level2_min_transfer_ratio = max(0.0, float(level2_min_transfer_ratio))
+        self.decoder_arch = str(decoder_arch)
+        self.unlearn_decoder_switch = str(unlearn_decoder_switch)
+        self.effidec_channels = list(effidec_channels or [48, 96, 192, 384])
+        self.effidec_n_decoder_channels = int(effidec_n_decoder_channels)
+        self.effidec_resolution_factor = int(effidec_resolution_factor)
+        self.effidec_skip_aggregation = str(effidec_skip_aggregation)
         self.clients_per_round = (
             None if clients_per_round is None else max(1, int(clients_per_round))
         )
@@ -665,6 +687,22 @@ class MyStrategy(fl.server.strategy.FedAvg):
         self.final_corrected_checkpoint_path = None
         self.final_level2_checkpoint_path = None
         self.level2_transfer_source_report = None
+
+    def decoder_args_namespace(self) -> Namespace:
+        return Namespace(
+            decoder_arch=self.decoder_arch,
+            unlearn_decoder_switch=self.unlearn_decoder_switch,
+            effidec_channels=self.effidec_channels,
+            effidec_n_decoder_channels=self.effidec_n_decoder_channels,
+            effidec_resolution_factor=self.effidec_resolution_factor,
+            effidec_skip_aggregation=self.effidec_skip_aggregation,
+        )
+
+    def unlearn_only_decoder_switch_requested(self) -> bool:
+        return (
+            self.decoder_arch == DECODER_ARCH_NNUNET
+            and self.unlearn_decoder_switch == DECODER_ARCH_EFFIDEC3D_UXNET
+        )
 
     def sample_fit_clients(
         self,
@@ -768,6 +806,18 @@ class MyStrategy(fl.server.strategy.FedAvg):
             preprocessor_name=self.plan_diff_preprocessor_name,
             gpu_memory_target_in_gb=self.plan_diff_gpu_memory_target,
         )
+        decoder_args = self.decoder_args_namespace()
+        if self.decoder_arch == DECODER_ARCH_EFFIDEC3D_UXNET:
+            minus_plan = apply_effidec3d_to_plans(
+                minus_plan,
+                decoder_args,
+                plans_identifier=minus_plans_identifier,
+            )
+            save_json(
+                minus_plan,
+                get_plan_path(planning_dataset_id, minus_plans_identifier),
+                sort_keys=False,
+            )
         level1_plans_identifier = (
             f"{self.plans_identifier}_level1_minus_target_{target_client}_{source_round_name}"
         )
@@ -794,8 +844,37 @@ class MyStrategy(fl.server.strategy.FedAvg):
             selected_level = int(unlearning_policy["level"])
         else:
             selected_level = int(self.unlearning_level)
+        if self.unlearn_only_decoder_switch_requested():
+            if self.unlearning_level not in ("auto", "2"):
+                raise RuntimeError(
+                    "unlearn-only decoder switching requires --unlearning_level auto or 2"
+                )
+            selected_level = 2
+            unlearning_policy = {
+                **unlearning_policy,
+                "decoder_switch_forced_level": 2,
+                "decoder_switch": DECODER_ARCH_EFFIDEC3D_UXNET,
+            }
         if selected_level == 1 and plan_diff.get("architecture_changed", False):
             raise RuntimeError("Level 1 unlearning requires architecture-compatible plans")
+        level2_plan = minus_plan
+        level2_plans_identifier = minus_plans_identifier
+        level2_decoder_switch_plan_path = None
+        if self.unlearn_only_decoder_switch_requested():
+            level2_plans_identifier = build_effidec3d_plans_identifier(
+                minus_plans_identifier,
+                decoder_args,
+            )
+            level2_plan = apply_effidec3d_to_plans(
+                minus_plan,
+                decoder_args,
+                plans_identifier=level2_plans_identifier,
+            )
+            level2_decoder_switch_plan_path = os.path.join(
+                artifact_dir,
+                "P_level2_effidec3d_uxnet_minus_target.json",
+            )
+            save_json(level2_plan, level2_decoder_switch_plan_path, sort_keys=False)
         critical_changes = get_preprocessing_critical_changes(plan_diff)
         should_repreprocess = (
             selected_level == 1
@@ -805,7 +884,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
         self.selected_unlearning_level = selected_level
         self.unlearning_policy = unlearning_policy
         self.level1_plans_identifier = level1_plans_identifier
-        self.level2_plans_identifier = minus_plans_identifier
+        self.level2_plans_identifier = level2_plans_identifier
         self.retained_client_ids = sorted(
             client_id
             for client_id in fingerprints_by_client
@@ -825,7 +904,9 @@ class MyStrategy(fl.server.strategy.FedAvg):
             "critical_changes": critical_changes,
             "should_repreprocess_retained": should_repreprocess,
             "plans_identifier": level1_plans_identifier if should_repreprocess else self.plans_identifier,
-            "level2_plans_identifier": minus_plans_identifier,
+            "level2_plans_identifier": level2_plans_identifier,
+            "decoder": decoder_metadata(decoder_args),
+            "unlearn_only_decoder_switch": self.unlearn_only_decoder_switch_requested(),
             "level2_rounds": self.level2_rounds_resolved,
             "retained_clients": self.retained_client_ids,
             "excluded_clients": [target_client],
@@ -853,10 +934,10 @@ class MyStrategy(fl.server.strategy.FedAvg):
             for retained_client_id in self.retained_client_ids:
                 retained_plan_path = get_plan_path(
                     int(retained_client_id),
-                    minus_plans_identifier,
+                    level2_plans_identifier,
                 )
                 maybe_mkdir_p(os.path.dirname(retained_plan_path))
-                save_json(minus_plan, retained_plan_path, sort_keys=False)
+                save_json(level2_plan, retained_plan_path, sort_keys=False)
                 level2_dataset_plan_paths[retained_client_id] = retained_plan_path
         minus_fingerprint_path = os.path.join(artifact_dir, "dataset_fingerprint_minus_target.json")
         save_json(minus_fingerprint, minus_fingerprint_path, sort_keys=False)
@@ -887,6 +968,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
                     **paths,
                     "unlearning_policy": policy_path,
                     "level1_plan": level1_plan_path,
+                    "level2_decoder_switch_plan": level2_decoder_switch_plan_path,
                     "level1_dataset_plans": level1_dataset_plan_paths,
                     "level2_dataset_plans": level2_dataset_plan_paths,
                     "dataset_fingerprint_minus_target": minus_fingerprint_path,
@@ -1650,6 +1732,8 @@ class MyStrategy(fl.server.strategy.FedAvg):
             "level2_epochs": self.level2_epochs,
             "level2_transfer_source": self.level2_transfer_source_report,
             "level2_min_transfer_ratio": self.level2_min_transfer_ratio,
+            "decoder": decoder_metadata(self.decoder_args_namespace()),
+            "unlearn_only_decoder_switch": self.unlearn_only_decoder_switch_requested(),
             "num_retained_rounds": len(self.federaser_retained_round_ids),
             "retained_rounds": self.federaser_retained_round_ids,
             "rounds": self.federaser_round_reports,
@@ -1922,6 +2006,7 @@ def main() -> None:
         default=0.0,
         help="Minimum compatible parameter ratio required from retained Level 2 clients. Default: 0.0.",
     )
+    add_decoder_arguments(parser, include_unlearn_switch=True)
 
     args = parser.parse_args()
     num_clients = args.num_clients
@@ -2001,6 +2086,12 @@ def main() -> None:
         level2_epochs=args.level2_epochs,
         level2_transfer_source=args.level2_transfer_source,
         level2_min_transfer_ratio=args.level2_min_transfer_ratio,
+        decoder_arch=args.decoder_arch,
+        unlearn_decoder_switch=args.unlearn_decoder_switch,
+        effidec_channels=args.effidec_channels,
+        effidec_n_decoder_channels=args.effidec_n_decoder_channels,
+        effidec_resolution_factor=args.effidec_resolution_factor,
+        effidec_skip_aggregation=args.effidec_skip_aggregation,
         clients_per_round=args.clients_per_round,
         min_available_clients=num_clients,
         min_fit_clients=args.clients_per_round or num_clients,

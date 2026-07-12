@@ -1,5 +1,12 @@
 import argparse
 
+from fednnunet.decoder_options import (
+    DECODER_ARCH_EFFIDEC3D_UXNET,
+    UNLEARN_DECODER_SWITCH_SAME,
+    add_decoder_arguments,
+    normalize_training_decoder_args,
+)
+
 
 def set_torch_interop_threads_once(torch_module, num_threads: int) -> None:
     try:
@@ -109,6 +116,7 @@ def add_training_arguments(parser_train: argparse.ArgumentParser) -> None:
         required=False,
         help="[OPTIONAL] Mark this client as the target client for federated unlearning.",
     )
+    add_decoder_arguments(parser_train, include_unlearn_switch=False)
 
 
 def add_unlearning_arguments(parser_unlearn: argparse.ArgumentParser) -> None:
@@ -163,6 +171,15 @@ def add_unlearning_arguments(parser_unlearn: argparse.ArgumentParser) -> None:
         required=False,
         action="store_true",
         help="[OPTIONAL] Print verbose preprocessing logs.",
+    )
+    parser_unlearn.add_argument(
+        "--unlearn_decoder_switch",
+        choices=(UNLEARN_DECODER_SWITCH_SAME, DECODER_ARCH_EFFIDEC3D_UXNET),
+        default=UNLEARN_DECODER_SWITCH_SAME,
+        help=(
+            "Experimental unlearn-only decoder switch. Use effidec3d_uxnet to "
+            "force Level 2 compatible transfer into an EffiDec3D model."
+        ),
     )
 
 
@@ -343,12 +360,15 @@ def build_client_parser() -> argparse.ArgumentParser:
         "DECREASE -np IF YOUR RAM FILLS UP TOO MUCH!. Default: 8 processes for 2d, 4 "
         "for 3d_fullres, 8 for 3d_lowres and 4 for everything else",
     )
+    add_decoder_arguments(parser_plan_and_preprocess, include_unlearn_switch=False)
     return parser
 
 
 def client_entry():
     parser = build_client_parser()
     args = parser.parse_args()
+    if args.task in ("train", "unlearn"):
+        normalize_training_decoder_args(args)
 
     import torch
 
