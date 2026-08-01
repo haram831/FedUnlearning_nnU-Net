@@ -99,6 +99,7 @@ testdata/
 *.jpeg
 .idea
 *.txt
+!requirements.txt
 .idea/*
 *.nii.gz
 *.nii
