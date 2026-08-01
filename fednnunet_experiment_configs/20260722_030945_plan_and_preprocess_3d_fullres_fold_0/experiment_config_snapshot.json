@@ -1,0 +1,75 @@
+{
+  "task": "plan_and_preprocess",
+  "dataset_ids": [
+    301,
+    302,
+    303
+  ],
+  "fold": 0,
+  "configuration": "3d_fullres",
+  "trainer": "nnUNetTrainerEffiDec3DUXNet",
+  "base_trainer": "nnUNetTrainer",
+  "plans_identifier": "nnUNetPlans_effidec3d_uxnet_c48x96x192x384_dc48_rf2_addition",
+  "base_plans_identifier": "nnUNetPlans",
+  "decoder": {
+    "decoder_arch": "effidec3d_uxnet",
+    "unlearn_decoder_switch": "same",
+    "effidec3d_uxnet": {
+      "depths": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "feat_size": [
+        48,
+        96,
+        192,
+        384
+      ],
+      "n_decoder_channels": 48,
+      "resolution_factor": 2,
+      "skip_aggregation": "addition",
+      "spatial_dims": 3,
+      "upsample_logits": true
+    }
+  },
+  "unlearning_args": {
+    "clients_per_round": null,
+    "unlearning_level": "auto",
+    "reuse_preprocessed": false,
+    "repreprocess_retained": false,
+    "correction_rounds": 0,
+    "correction_epochs": 1,
+    "level2_rounds": null,
+    "level2_epochs": 1,
+    "level2_transfer_source": "latest_global",
+    "level2_min_transfer_ratio": 0.0
+  },
+  "preprocessing_args": {
+    "gpu_memory_target": null,
+    "fingerprint_extractor": "DatasetFingerprintExtractor",
+    "num_processes_fingerprint": 8,
+    "verify_dataset_integrity": false,
+    "no_pp": false,
+    "clean": false,
+    "planner": "ExperimentPlanner",
+    "preprocessor_name": "DefaultPreprocessor",
+    "overwrite_target_spacing": null,
+    "overwrite_plans_name": null,
+    "configurations": [
+      "2d",
+      "3d_fullres",
+      "3d_lowres"
+    ],
+    "num_processes_preprocessing": null,
+    "verbose": false,
+    "raw_unknown_args": []
+  },
+  "server_command": "CUDA_VISIBLE_DEVICES=0 python fednnunet/server.py plan_and_preprocess -n 3 --port 8080",
+  "client_commands": {
+    "301": "CUDA_VISIBLE_DEVICES=0 python fednnunet/client.py --port 8080 --client_id 301 plan_and_preprocess -d 301 --decoder_arch effidec3d_uxnet --effidec_channels 48 96 192 384 --effidec_n_decoder_channels 48 --effidec_resolution_factor 2 --effidec_skip_aggregation addition ",
+    "302": "CUDA_VISIBLE_DEVICES=0 python fednnunet/client.py --port 8080 --client_id 302 plan_and_preprocess -d 302 --decoder_arch effidec3d_uxnet --effidec_channels 48 96 192 384 --effidec_n_decoder_channels 48 --effidec_resolution_factor 2 --effidec_skip_aggregation addition ",
+    "303": "CUDA_VISIBLE_DEVICES=0 python fednnunet/client.py --port 8080 --client_id 303 plan_and_preprocess -d 303 --decoder_arch effidec3d_uxnet --effidec_channels 48 96 192 384 --effidec_n_decoder_channels 48 --effidec_resolution_factor 2 --effidec_skip_aggregation addition "
+  }
+}
