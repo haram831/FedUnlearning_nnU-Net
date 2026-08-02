@@ -9,7 +9,15 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import flwr as fl
 import numpy as np
 import torch
-from flwr.common import Code, EvaluateRes, FitRes, GetParametersRes, Parameters, Status
+from flwr.common import (
+    Code,
+    EvaluateRes,
+    FitRes,
+    GetParametersRes,
+    GetPropertiesRes,
+    Parameters,
+    Status,
+)
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 sys.path.append(
@@ -39,6 +47,10 @@ from fednnunet.decoder_options import (
     should_use_effidec3d_for_training,
 )
 from fednnunet.run_training import run_training
+from fednnunet.run_artifacts import (
+    resolve_client_resume_checkpoint,
+    save_pending_client_checkpoint,
+)
 
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -124,6 +136,9 @@ class FlowerClient(fl.client.Client):
         self.dataset_name = maybe_convert_to_dataset_name(args.dataset_name_or_id)
         self.dataset_id = convert_dataset_name_to_id(self.dataset_name)
         self.client_id = getattr(args, "client_id", None) or str(self.dataset_id)
+        self.artifact_dir = getattr(args, "artifact_dir", None)
+        self.resume_round = int(getattr(args, "resume_round", 0) or 0)
+        self.resume_loaded_contexts = set()
         self.num_samples = None
         self.extract_fingerprint = False
         self.plan_experiment = False
@@ -208,6 +223,36 @@ class FlowerClient(fl.client.Client):
             return_trainer=True,
         )
         self.trainer.initialize()
+        context_key = (plans_identifier, trainer_class_name)
+        if (
+            self.task == "train"
+            and self.artifact_dir
+            and self.resume_round > 0
+            and context_key not in self.resume_loaded_contexts
+        ):
+            resolved = resolve_client_resume_checkpoint(
+                self.artifact_dir,
+                self.client_id,
+                self.resume_round,
+            )
+            if resolved is None:
+                logging.warning(
+                    "No committed client checkpoint found for client %s through "
+                    "round %s; optimizer state will start fresh",
+                    self.client_id,
+                    self.resume_round,
+                )
+            else:
+                checkpoint_path, metadata = resolved
+                self.trainer.load_checkpoint(checkpoint_path)
+                logging.info(
+                    "Restored client %s from global round %s at local epoch %s: %s",
+                    self.client_id,
+                    metadata.get("global_round"),
+                    metadata.get("current_epoch"),
+                    checkpoint_path,
+                )
+            self.resume_loaded_contexts.add(context_key)
         self.model = self.trainer.network
         self.trainer.on_train_start()
         self.current_plans_identifier = plans_identifier
@@ -374,6 +419,16 @@ class FlowerClient(fl.client.Client):
             status=Status(code=Code(0), message="caguento"),
         )
         return parm
+
+    def get_properties(self, ins):
+        return GetPropertiesRes(
+            status=Status(code=Code(0), message=""),
+            properties={
+                "client_id": str(self.client_id),
+                "dataset_id": int(self.dataset_id),
+                "dataset_name": str(self.dataset_name),
+            },
+        )
 
     def set_parameters(self, parameters, plans_identifier: Optional[str] = None):
 
@@ -715,6 +770,15 @@ class FlowerClient(fl.client.Client):
             except Exception as e:
                 logging.error(f"An unexpected error occurred: {e}")
                 raise
+
+            global_round = int(config.get("global_round", 0) or 0)
+            if self.task == "train" and self.artifact_dir and global_round > 0:
+                save_pending_client_checkpoint(
+                    self.trainer,
+                    self.artifact_dir,
+                    self.client_id,
+                    global_round,
+                )
 
             tl = np.round(
                 self.trainer.logger.my_fantastic_logging["train_losses"][-1], decimals=4

@@ -235,6 +235,18 @@ def build_client_parser() -> argparse.ArgumentParser:
         default=None,
         help="[OPTIONAL] Logical federated/unlearning client identifier. Defaults to str(dataset_id).",
     )
+    parser.add_argument(
+        "--artifact_dir",
+        type=str,
+        default=None,
+        help="Isolated run artifact directory used for resumable checkpoints.",
+    )
+    parser.add_argument(
+        "--resume_round",
+        type=int,
+        default=0,
+        help="Last globally committed round to restore before connecting.",
+    )
 
     subparsers = parser.add_subparsers(
         help="Select the nnUNetv2 command to be executed", dest="task", required=True
@@ -369,6 +381,14 @@ def client_entry():
     args = parser.parse_args()
     if args.task in ("train", "unlearn"):
         normalize_training_decoder_args(args)
+    if args.resume_round < 0:
+        raise ValueError("--resume_round must be non-negative")
+    if args.resume_round and not args.artifact_dir:
+        raise ValueError("--resume_round requires --artifact_dir")
+    if args.task == "train" and args.artifact_dir and args.disable_checkpointing:
+        raise ValueError("Isolated resumable training requires checkpointing to be enabled")
+    if args.task == "train" and args.resume_round and args.c:
+        raise ValueError("Do not combine run-level --resume_round with nnU-Net --c")
 
     import torch
 

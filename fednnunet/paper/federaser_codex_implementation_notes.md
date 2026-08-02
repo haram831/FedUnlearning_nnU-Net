@@ -131,7 +131,7 @@ Output:
 6. server는 저장된 historical update U_kc^tj의 norm과 current update Û_kc^tj의 direction을 결합하여 calibrated update Ũ_kc^tj를 만든다.
 7. server는 calibrated updates를 weighted average로 aggregation한다.
 8. Mf를 aggregated calibrated update로 갱신한다.
-9. 모든 retained round를 처리하면 최종 Mf를 반환한다.
+9. 모든 retained round를 처리하면 최종 Mf를 반환한다
 ```
 
 ---

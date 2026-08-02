@@ -8,7 +8,15 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import flwr as fl
 import torch
 from batchgenerators.utilities.file_and_folder_operations import load_json, maybe_mkdir_p, save_json
-from flwr.common import EvaluateIns, FitIns, MetricsAggregationFn, NDArrays, Parameters, Scalar
+from flwr.common import (
+    EvaluateIns,
+    FitIns,
+    GetPropertiesIns,
+    MetricsAggregationFn,
+    NDArrays,
+    Parameters,
+    Scalar,
+)
 from flwr.common.logger import log
 from flwr.server.client_manager import ClientManager
 from flwr.server.client_proxy import ClientProxy
@@ -57,6 +65,11 @@ from fednnunet.unlearning_policy import (
     DEFAULT_TAU_PLAN_LOW,
     decide_unlearning_policy,
     save_unlearning_policy_artifact,
+)
+from fednnunet.run_artifacts import (
+    commit_pending_client_checkpoint,
+    load_resume_global_checkpoint,
+    save_resume_global_checkpoint,
 )
 
 
@@ -224,6 +237,9 @@ def load_latest_global_fingerprint() -> Dict[str, Any]:
 
 
 def get_federaser_artifact_dir() -> str:
+    configured_artifact_dir = os.environ.get("FEDNNUNET_ARTIFACT_DIR")
+    if configured_artifact_dir:
+        return os.path.abspath(configured_artifact_dir)
     nnunet_preprocessed = os.environ.get("nnUNet_preprocessed")
     if nnunet_preprocessed is None:
         nnunet_preprocessed = os.path.join(
@@ -589,6 +605,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
         effidec_resolution_factor: int = 2,
         effidec_skip_aggregation: str = "addition",
         clients_per_round: Optional[int] = None,
+        round_offset: int = 0,
         *,
         fraction_fit: float = 1.0,
         fraction_evaluate: float = 1.0,
@@ -630,6 +647,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
         self.delta_t = delta_t
         self.r = r
         self.total_rounds = total_rounds
+        self.round_offset = max(0, int(round_offset))
         self.planning_dataset_id = planning_dataset_id
         self.plans_identifier = plans_identifier
         self.plan_diff_planner = plan_diff_planner
@@ -661,9 +679,14 @@ class MyStrategy(fl.server.strategy.FedAvg):
         self.clients_per_round = (
             None if clients_per_round is None else max(1, int(clients_per_round))
         )
+        self.logical_client_ids: Dict[str, str] = {}
         self.saved_plan_diff_artifact = False
-        self.latest_global_state_dict = None
-        self.saved_initial_federaser_checkpoint = False
+        self.latest_global_state_dict = (
+            parameters_to_state_dict(initial_parameters)
+            if task == "train" and initial_parameters is not None
+            else None
+        )
+        self.saved_initial_federaser_checkpoint = self.round_offset > 0
         self.federaser_initialized = False
         self.federaser_current_state_dict = None
         self.federaser_retained_round_ids: List[int] = []
@@ -715,8 +738,8 @@ class MyStrategy(fl.server.strategy.FedAvg):
             allowed = set(str(client_id) for client_id in allowed_client_ids)
             clients = [
                 client
-                for cid, client in available_clients.items()
-                if str(cid) in allowed
+                for client in available_clients.values()
+                if self.get_logical_client_id_for_proxy(client) in allowed
             ]
         else:
             clients = list(available_clients.values())
@@ -730,13 +753,25 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 min_num_clients=min_num_clients,
             )
 
-        clients = sorted(clients, key=lambda client: str(client.cid))
+        clients = sorted(clients, key=self.get_logical_client_id_for_proxy)
         if self.clients_per_round is None or self.clients_per_round >= len(clients):
             return clients
 
         start = ((server_round - 1) * self.clients_per_round) % len(clients)
         doubled = clients + clients
         return doubled[start : start + self.clients_per_round]
+
+    def get_logical_client_id_for_proxy(self, client: ClientProxy) -> str:
+        if client.cid not in self.logical_client_ids:
+            response = client.get_properties(
+                ins=GetPropertiesIns(config={}),
+                timeout=None,
+                group_id=None,
+            )
+            self.logical_client_ids[client.cid] = str(
+                response.properties.get("client_id", client.cid)
+            )
+        return self.logical_client_ids[client.cid]
 
     def create_unlearning_plan_diff_artifact(self) -> None:
         if self.saved_plan_diff_artifact:
@@ -1067,7 +1102,11 @@ class MyStrategy(fl.server.strategy.FedAvg):
         )
         if not self.retained_client_ids:
             return clients
-        retained = [client for client in clients if str(client.cid) in self.retained_client_ids]
+        retained = [
+            client
+            for client in clients
+            if self.get_logical_client_id_for_proxy(client) in self.retained_client_ids
+        ]
         return retained or clients
 
     def should_save_federaser_artifact(self, global_round: int) -> bool:
@@ -1088,6 +1127,13 @@ class MyStrategy(fl.server.strategy.FedAvg):
             delta_t=self.delta_t,
             total_rounds=self.total_rounds,
         )
+        if self.task == "train":
+            save_resume_global_checkpoint(
+                get_federaser_artifact_dir(),
+                0,
+                self.total_rounds,
+                global_state_dict,
+            )
         self.saved_initial_federaser_checkpoint = True
 
     def find_common_layers(self, state_dicts):
@@ -1124,6 +1170,11 @@ class MyStrategy(fl.server.strategy.FedAvg):
         self, server_round: int, parameters: Parameters, client_manager: ClientManager
     ) -> List[Tuple[ClientProxy, FitIns]]:
         """Configure the next round of training."""
+        logical_round = (
+            self.round_offset + server_round
+            if self.task == "train"
+            else server_round
+        )
         self.create_unlearning_plan_diff_artifact()
         config = {}
         if self.task == "unlearn":
@@ -1266,12 +1317,14 @@ class MyStrategy(fl.server.strategy.FedAvg):
             config["r"] = self.r
         if self.on_fit_config_fn is not None:
             # Custom fit config function provided
-            config.update(self.on_fit_config_fn(server_round))
+            config.update(self.on_fit_config_fn(logical_round))
+        if self.task == "train":
+            config["global_round"] = logical_round
         fit_ins = FitIns(parameters, config)
 
         # Sample clients
         clients = self.sample_fit_clients(
-            server_round=server_round,
+            server_round=logical_round,
             client_manager=client_manager,
         )
         if self.task == "extract_fingerprint" or self.task == "plan_and_preprocess":
@@ -1380,11 +1433,12 @@ class MyStrategy(fl.server.strategy.FedAvg):
             return self.aggregate_federaser_calibration_round(rnd, successful_results)
 
         # Perform aggregation on successful results
-        save_aggregation_metadata(rnd, successful_results)
-        if self.should_save_federaser_artifact(rnd) and self.latest_global_state_dict is not None:
+        logical_round = self.round_offset + rnd
+        save_aggregation_metadata(logical_round, successful_results)
+        if self.should_save_federaser_artifact(logical_round) and self.latest_global_state_dict is not None:
             for client_proxy, fit_res in successful_results:
                 save_client_update(
-                    rnd,
+                    logical_round,
                     get_logical_client_id(client_proxy, fit_res),
                     parameters_to_state_dict(fit_res.parameters),
                     self.latest_global_state_dict,
@@ -1395,19 +1449,35 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 )
         aggregated_weights = self.aggregate_weights(successful_results)
         self.latest_global_state_dict = parameters_to_state_dict(aggregated_weights)
-        if self.should_save_federaser_artifact(rnd):
+        if self.should_save_federaser_artifact(logical_round):
             save_global_checkpoint(
-                rnd,
+                logical_round,
                 self.latest_global_state_dict,
                 delta_t=self.delta_t,
                 total_rounds=self.total_rounds,
             )
+        save_resume_global_checkpoint(
+            get_federaser_artifact_dir(),
+            logical_round,
+            self.total_rounds,
+            self.latest_global_state_dict,
+        )
+        for client_proxy, fit_res in successful_results:
+            client_id = get_logical_client_id(client_proxy, fit_res)
+            if not commit_pending_client_checkpoint(
+                get_federaser_artifact_dir(), client_id, logical_round
+            ):
+                log(
+                    WARNING,
+                    f"No pending resume checkpoint to commit for client {client_id} "
+                    f"at round {logical_round}",
+                )
         # Aggregate custom metrics if aggregation fn was provided
         metrics_aggregated = {}
         if self.fit_metrics_aggregation_fn:
             fit_metrics = [(res.num_examples, res.metrics) for _, res in results]
             metrics_aggregated = self.fit_metrics_aggregation_fn(fit_metrics)
-        elif rnd == 1:  # Only log this warning once
+        elif logical_round == 1:  # Only log this warning once
             log(WARNING, "No fit_metrics_aggregation_fn provided")
 
         return aggregated_weights, average_dicts(
@@ -1869,6 +1939,18 @@ def main() -> None:
         "--port", type=int, required=True, help="Port number for the server to listen on"
     )
     parser.add_argument(
+        "--artifact_dir",
+        type=str,
+        default=None,
+        help="Isolated run artifact directory for checkpoints and FedEraser history.",
+    )
+    parser.add_argument(
+        "--resume_round",
+        type=int,
+        default=0,
+        help="Last globally committed training round to restore.",
+    )
+    parser.add_argument(
         "--num_rounds",
         type=int,
         default=None,
@@ -2011,6 +2093,15 @@ def main() -> None:
     args = parser.parse_args()
     num_clients = args.num_clients
 
+    if args.artifact_dir:
+        os.environ["FEDNNUNET_ARTIFACT_DIR"] = os.path.abspath(args.artifact_dir)
+    if args.resume_round < 0:
+        raise ValueError("--resume_round must be non-negative")
+    if args.resume_round and args.task != "train":
+        raise ValueError("--resume_round is only supported for training")
+    if args.resume_round and not args.artifact_dir:
+        raise ValueError("--resume_round requires --artifact_dir")
+
     if args.task == "unlearn" and args.target_client is None:
         raise ValueError("--target_client must be specified for the unlearn task")
     if args.delta_t <= 0:
@@ -2062,6 +2153,23 @@ def main() -> None:
             raise ValueError("Fingerprint extraction requires at least 2 rounds")
         num_rounds = args.num_rounds
 
+    initial_parameters = None
+    if args.resume_round:
+        saved_round, _, saved_state_dict = load_resume_global_checkpoint(
+            get_federaser_artifact_dir()
+        )
+        if saved_round != args.resume_round:
+            raise ValueError(
+                f"Requested resume round {args.resume_round} does not match "
+                f"checkpoint round {saved_round}"
+            )
+        if saved_round >= num_rounds:
+            raise ValueError(
+                f"Training is already complete at round {saved_round} of {num_rounds}. "
+                "Increase --num_rounds to extend it."
+            )
+        initial_parameters = state_dict_to_parameters(saved_state_dict)
+
     strategy = MyStrategy(
         args.task,
         target_client=args.target_client,
@@ -2093,16 +2201,19 @@ def main() -> None:
         effidec_resolution_factor=args.effidec_resolution_factor,
         effidec_skip_aggregation=args.effidec_skip_aggregation,
         clients_per_round=args.clients_per_round,
+        round_offset=args.resume_round,
         min_available_clients=num_clients,
         min_fit_clients=args.clients_per_round or num_clients,
         min_evaluate_clients=num_clients,
         fraction_evaluate=fraction_evaluate,
+        initial_parameters=initial_parameters,
     )
 
+    rounds_to_run = num_rounds - args.resume_round
     fl.server.start_server(
         server_address=f"0.0.0.0:{args.port}",
         strategy=strategy,
-        config=fl.server.ServerConfig(num_rounds=num_rounds),
+        config=fl.server.ServerConfig(num_rounds=rounds_to_run),
         grpc_max_message_length=2147483647,  # Request a maximum message length to support sending weights from larger, more recent ResEnc architectures
     )
 

@@ -153,6 +153,35 @@ python fednnunet/run.py train "301 302 303 304 305" 2d 1 --port 8080
 
 This will run the AsymFedAvg federated training for `2d` configuration model and `1` cross-validation fold.
 
+### Isolated and resumable training runs
+
+Give a training run a stable ID to keep its nnU-Net results, FedEraser history,
+global resume checkpoint, and per-client optimizer/epoch checkpoints separate:
+
+```bash
+python fednnunet/run.py train "301 302 303" 3d_fullres 0 \
+  --port 8080 --clients_per_round 1 --num_rounds 120 \
+  --run_id nnunet_baseline_fold0
+```
+
+Runs are stored under
+`$nnUNet_preprocessed/fednnunet_runs/<run_id>/`. If the process or system is
+interrupted, repeat the same configuration with `--resume`:
+
+```bash
+python fednnunet/run.py train "301 302 303" 3d_fullres 0 \
+  --port 8080 --clients_per_round 1 --num_rounds 120 \
+  --run_id nnunet_baseline_fold0 --resume
+```
+
+`--num_rounds` is the final global round, not the number of additional rounds.
+To extend a completed 120-round run to 150 rounds, resume it with
+`--num_rounds 150`. Resume validates the datasets, fold, trainer, plans,
+decoder, and client sampling configuration against the saved run manifest.
+Only a globally aggregated round is considered committed; a client checkpoint
+written immediately before an interruption is ignored unless the matching
+global round was committed by the server.
+
 
 ## Evaluation
 

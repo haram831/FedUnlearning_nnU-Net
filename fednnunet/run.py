@@ -2,6 +2,7 @@ import argparse
 from datetime import datetime
 import json
 import os
+import shlex
 import subprocess
 
 from fednnunet.decoder_options import (
@@ -10,6 +11,16 @@ from fednnunet.decoder_options import (
     decoder_options_to_cli_args,
     effective_training_plans_identifier,
     effective_training_trainer,
+)
+from fednnunet.run_artifacts import (
+    get_artifact_dir,
+    get_results_dir,
+    get_run_dir,
+    load_resume_global_checkpoint,
+    load_run_manifest,
+    make_run_id,
+    validate_resume_manifest,
+    write_run_manifest,
 )
 
 # Convenience script to run federated training on a multi-gpu cluster
@@ -66,6 +77,30 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Number of clients to train in each federated round. Defaults to all clients.",
+    )
+    parser.add_argument(
+        "--run_id",
+        type=str,
+        default=None,
+        help=(
+            "Stable identifier for an isolated training run. A timestamp-based ID "
+            "is generated for new training when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Resume an existing --run_id from its latest committed global checkpoint.",
+    )
+    parser.add_argument(
+        "--runs_root",
+        type=str,
+        default=None,
+        help=(
+            "Directory containing isolated runs. Defaults to "
+            "$nnUNet_preprocessed/fednnunet_runs."
+        ),
     )
     parser.add_argument(
         "--target_client",
@@ -246,6 +281,10 @@ def save_experiment_config_snapshot(
     fold,
     server_command,
     client_commands,
+    run_dir=None,
+    run_id=None,
+    artifact_dir=None,
+    resume_round=0,
 ):
     base_trainer = get_option_value(unknown, ("-tr",), "nnUNetTrainer")
     base_plans_identifier = get_option_value(unknown, ("-p",), "nnUNetPlans")
@@ -254,15 +293,22 @@ def save_experiment_config_snapshot(
         base_plans_identifier,
         args,
     )
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    snapshot_dir = os.path.join(
+    snapshot_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    snapshot_dir = run_dir or os.path.join(
         get_experiment_snapshot_dir(),
-        f"{run_id}_{args.task}_{args.configuration}_fold_{fold}",
+        f"{snapshot_timestamp}_{args.task}_{args.configuration}_fold_{fold}",
     )
     os.makedirs(snapshot_dir, exist_ok=True)
-    snapshot_path = os.path.join(snapshot_dir, "experiment_config_snapshot.json")
+    snapshot_name = "experiment_config_snapshot.json"
+    if run_dir and getattr(args, "resume", False):
+        snapshot_name = f"resume_{snapshot_timestamp}_experiment_config_snapshot.json"
+    snapshot_path = os.path.join(snapshot_dir, snapshot_name)
 
     snapshot = {
+        "run_id": run_id,
+        "artifact_dir": artifact_dir,
+        "resume": bool(getattr(args, "resume", False)),
+        "resume_round": int(resume_round),
         "task": args.task,
         "dataset_ids": datasets,
         "fold": fold,
@@ -302,6 +348,12 @@ def main():
     task = args.task
     fold = args.fold
 
+    if args.resume and task != "train":
+        raise ValueError("--resume is only supported for the train task")
+    if args.resume and not args.run_id:
+        raise ValueError("--resume requires --run_id")
+    if args.resume and "--c" in unknown:
+        raise ValueError("Do not combine run-level --resume with nnU-Net --c")
     if task == "unlearn" and args.target_client is None:
         raise ValueError("--target_client must be specified for the unlearn task")
     if args.target_client is not None and args.target_client not in datasets:
@@ -339,6 +391,8 @@ def main():
         gpu_memory_target_mapping = dict(zip(datasets, gpu_memory_target))
 
     folds = get_folds(task, fold)
+    if args.resume and len(folds) != 1:
+        raise ValueError("--resume supports exactly one fold at a time")
 
     configuration = args.configuration
     base_trainer = get_option_value(unknown, ("-tr",), "nnUNetTrainer")
@@ -406,10 +460,110 @@ def main():
         print(f"Starting {task} for fold {fold}")
         client_processes = []
         try:
+            run_id = None
+            run_dir = None
+            artifact_dir = None
+            results_dir = None
+            resume_round = 0
+            total_rounds = args.num_rounds
+
+            if task == "train":
+                run_id = args.run_id or make_run_id(task, configuration, fold)
+                if args.run_id and len(folds) > 1:
+                    run_id = f"{args.run_id}_fold_{fold}"
+                run_dir = get_run_dir(run_id, args.runs_root)
+                artifact_dir = get_artifact_dir(run_dir)
+                results_dir = get_results_dir(run_dir)
+                requested_total_rounds = args.num_rounds or 1000
+                manifest_fields = {
+                    "task": task,
+                    "dataset_ids": datasets,
+                    "fold": fold,
+                    "configuration": configuration,
+                    "trainer": effective_trainer,
+                    "plans_identifier": effective_plans_identifier,
+                    "decoder": decoder_metadata(args),
+                    "clients_per_round": args.clients_per_round,
+                    "client_args": list(unknown),
+                }
+                if args.resume:
+                    manifest = load_run_manifest(run_dir)
+                    resume_round, saved_total_rounds, _ = load_resume_global_checkpoint(
+                        artifact_dir
+                    )
+                    total_rounds = args.num_rounds or saved_total_rounds
+                    validate_resume_manifest(
+                        manifest,
+                        manifest_fields,
+                    )
+                    if total_rounds < resume_round:
+                        raise ValueError(
+                            f"Requested total_rounds {total_rounds} is below the "
+                            f"committed resume round {resume_round}"
+                        )
+                    if resume_round >= total_rounds:
+                        raise ValueError(
+                            f"Run {run_id} is already complete at round {resume_round}. "
+                            "Specify a larger --num_rounds to extend it."
+                        )
+                    if total_rounds != saved_total_rounds:
+                        manifest["total_rounds"] = total_rounds
+                        manifest["extended_from_total_rounds"] = saved_total_rounds
+                        write_run_manifest(run_dir, manifest)
+                    print(
+                        f"Resuming isolated run {run_id} from round {resume_round} "
+                        f"of {total_rounds}"
+                    )
+                else:
+                    manifest_path = os.path.join(run_dir, "run_manifest.json")
+                    if os.path.exists(manifest_path):
+                        raise FileExistsError(
+                            f"Run {run_id} already exists. Use --resume to continue it."
+                        )
+                    total_rounds = requested_total_rounds
+                    os.makedirs(artifact_dir, exist_ok=True)
+                    os.makedirs(results_dir, exist_ok=True)
+                    write_run_manifest(
+                        run_dir,
+                        {
+                            "format_version": 1,
+                            "run_id": run_id,
+                            "created_at": datetime.now().isoformat(),
+                            **manifest_fields,
+                            "total_rounds": total_rounds,
+                            "artifact_dir": artifact_dir,
+                            "results_dir": results_dir,
+                        },
+                    )
+                    print(f"Created isolated run {run_id} at {run_dir}")
+            elif task == "unlearn" and args.run_id:
+                run_id = args.run_id
+                run_dir = get_run_dir(run_id, args.runs_root)
+                load_run_manifest(run_dir)
+                artifact_dir = get_artifact_dir(run_dir)
+                results_dir = get_results_dir(run_dir)
+
             print("Starting server")
             if multi_gpu:
                 process_prefix = "CUDA_VISIBLE_DEVICES=0"
-            server_command = f"{process_prefix} python fednnunet/server.py {task} -n {num_clients} --port {port}{server_optional_args}"
+            fold_server_optional_args = server_optional_args
+            if task == "train" and args.num_rounds is None:
+                fold_server_optional_args += f" --num_rounds {total_rounds}"
+            if artifact_dir:
+                fold_server_optional_args += (
+                    f" --artifact_dir {shlex.quote(artifact_dir)}"
+                )
+            if resume_round:
+                fold_server_optional_args += f" --resume_round {resume_round}"
+            server_environment = ""
+            if artifact_dir:
+                server_environment = (
+                    f"FEDNNUNET_ARTIFACT_DIR={shlex.quote(artifact_dir)} "
+                )
+            server_command = (
+                f"{process_prefix} {server_environment}python fednnunet/server.py "
+                f"{task} -n {num_clients} --port {port}{fold_server_optional_args}"
+            )
 
             client_commands = {}
             for client_dataset in datasets:
@@ -419,6 +573,10 @@ def main():
                     process_prefix = f"CUDA_VISIBLE_DEVICES={gpu}"
 
                 client_global_args = f"--port {port} --client_id {client_id}"
+                if artifact_dir:
+                    client_global_args += f" --artifact_dir {shlex.quote(artifact_dir)}"
+                if resume_round:
+                    client_global_args += f" --resume_round {resume_round}"
                 optional_args = ""
                 # pass the undefined arguments to the client
                 if unknown:
@@ -443,12 +601,19 @@ def main():
                         f"--correction_epochs {args.correction_epochs} "
                         f"--level2_epochs {args.level2_epochs} "
                     )
+                client_environment = ""
+                if artifact_dir:
+                    client_environment += (
+                        f"FEDNNUNET_ARTIFACT_DIR={shlex.quote(artifact_dir)} "
+                    )
+                if results_dir:
+                    client_environment += f"nnUNet_results={shlex.quote(results_dir)} "
                 if task == "plan_and_preprocess":
-                    command = f"{process_prefix} python fednnunet/client.py {client_global_args} {task} -d {client_dataset} {optional_args}"
+                    command = f"{process_prefix} {client_environment}python fednnunet/client.py {client_global_args} {task} -d {client_dataset} {optional_args}"
                 elif task in ("train", "unlearn"):
-                    command = f"{process_prefix} python fednnunet/client.py {client_global_args} {task} {client_dataset} {configuration} {fold} {optional_args}"
+                    command = f"{process_prefix} {client_environment}python fednnunet/client.py {client_global_args} {task} {client_dataset} {configuration} {fold} {optional_args}"
                 else:
-                    command = f"{process_prefix} python fednnunet/client.py {client_global_args} {task} -d {client_dataset} {optional_args}"
+                    command = f"{process_prefix} {client_environment}python fednnunet/client.py {client_global_args} {task} -d {client_dataset} {optional_args}"
                 client_commands[str(client_dataset)] = command
 
             snapshot_path = save_experiment_config_snapshot(
@@ -458,6 +623,10 @@ def main():
                 fold,
                 server_command,
                 client_commands,
+                run_dir=run_dir,
+                run_id=run_id,
+                artifact_dir=artifact_dir,
+                resume_round=resume_round,
             )
             print(f"Experiment config snapshot saved to {snapshot_path}")
 
@@ -470,7 +639,10 @@ def main():
             # Break when "ready" is printed
             for line in server_process.stderr:
                 print(line, end="")  # process line here
-                if "Requesting initial parameters" in line:
+                if (
+                    "Requesting initial parameters" in line
+                    or "Using initial global parameters provided by strategy" in line
+                ):
                     break
 
             for client_dataset in datasets:
@@ -488,6 +660,20 @@ def main():
                 print(line, end="")
 
             server_process.wait()
+            if task == "train" and run_dir and artifact_dir:
+                manifest = load_run_manifest(run_dir)
+                try:
+                    completed_round, _, _ = load_resume_global_checkpoint(artifact_dir)
+                except RuntimeError:
+                    completed_round = resume_round
+                manifest["last_completed_round"] = completed_round
+                manifest["status"] = (
+                    "completed"
+                    if server_process.returncode == 0 and completed_round >= total_rounds
+                    else "stopped"
+                )
+                manifest["updated_at"] = datetime.now().isoformat()
+                write_run_manifest(run_dir, manifest)
 
         except KeyboardInterrupt:
             server_process.terminate()
